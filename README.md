@@ -30,6 +30,8 @@ uv pip install -e ".[agent]"
 # FlashInfer: choose local on Linux with a GPU, or Modal from any machine
 # uv pip install -e ".[agent,local]"
 # uv pip install -e ".[agent,modal]"
+# On a SLURM cluster nothing extra is needed here: the GPU stack lives in the
+# container image. See configs/slurm.toml.
 ```
 
 Make sure omp + your model provider is ready.
@@ -172,12 +174,14 @@ experiments/         experiment notes and snapshots
 
 FlashInfer and arbitrary repositories use the same `BenchmarkAdapter`:
 
-- `FlashInferAdapter` packages kernel sources and sends them through a local or Modal
-  execution backend.
+- `FlashInferAdapter` packages kernel sources and sends them through a local, Modal, fal,
+  or SLURM execution backend.
 - `GeneratedTaskAdapter` runs the repository-specific validation and benchmark scripts
   created by the setup agent.
 - Kbench supplies quick/full execution, normalized measurements, history, and paired
   A/B for both adapters.
+- On SLURM both adapters can run inside a pyxis container on a node you already hold, via
+  `srun --overlap`. See [configs/slurm.toml](./configs/slurm.toml).
 
 See [kbench/README.md](./kbench/README.md) and [kopt/README.md](./kopt/README.md) for the
 small class diagrams.

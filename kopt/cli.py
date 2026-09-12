@@ -211,7 +211,7 @@ def main() -> int:
     i.add_argument("project", nargs="?",
                    help="directory to create (default: work/<definition name>)")
     i.add_argument("--language", default="triton", choices=languages())
-    i.add_argument("--backend", default="modal", choices=("local", "modal", "fal"))
+    i.add_argument("--backend", default="modal", choices=("local", "modal", "fal", "slurm"))
     i.add_argument("--gpu", default="B200")
     i.add_argument("--force", action="store_true", help="overwrite a non-empty directory")
     i.set_defaults(func=cmd_init)

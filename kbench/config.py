@@ -55,6 +55,8 @@ class TaskConfig:
     # [task.env]
     env: dict[str, str]
     path_prepend: str
+    # [task.slurm] — empty unless the scripts run through an srun container
+    slurm: dict
 
     @property
     def work(self) -> Path:
@@ -104,6 +106,7 @@ def _load_task(root: Path, raw: dict) -> TaskConfig:
         gpu=hw.get("gpu", "GPU"),
         env={str(k): str(v) for k, v in task.get("env", {}).items()},
         path_prepend=task.get("path_prepend", ""),
+        slurm=task.get("slurm", {}),
     )
 
 
@@ -121,6 +124,8 @@ class Config:
     gpu_count: int
     timeout_s: int
     image: ImageSpec
+    # [remote.slurm] — only read by the slurm backend
+    slurm: dict
     # [remote.data]
     data_path: str  # where the trace set is mounted inside the container
     modal_volume: str
@@ -177,6 +182,7 @@ def load(root: Path | None = None) -> Config | TaskConfig:
             run=tuple(img.get("run", ())),
             env=dict(img.get("env", {})),
         ),
+        slurm=remote.get("slurm", {}),
         data_path=data.get("path", "/data"),
         modal_volume=data.get("modal_volume", "flashinfer-trace"),
         local_path=os.path.expanduser(data.get("local_path", "~/flashinfer-trace")),

@@ -1,0 +1,65 @@
+# SLURM + pyxis/enroot: run on a node you already hold.
+#
+# The backend does not allocate anything. Hold the node yourself, then point `jobid` at it
+# (or export KBENCH_SLURM_JOBID, which wins over this file so a new allocation is not a
+# config edit). Keeping one allocation across many runs keeps the container and page cache
+# warm, which is most of the wall clock on a short benchmark.
+#
+#   sbatch -N1 --gres=gpu:4 -t 24:00:00 --exclusive --wrap="sleep 86400"
+#   KBENCH_SLURM_JOBID=<id> kbench bench --quick
+#
+# Nothing is shared by import: the driving machine is usually a login node whose home
+# directory the compute nodes cannot see. Both the project and `stage` must therefore sit
+# on a filesystem listed in `mounts` — a project on node-local /home fails immediately,
+# naming the path.
+
+[kernel]
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+language = "triton"
+source_dir = "triton"
+entry_point = "solution_fused.py::kernel"
+
+[remote]
+backend = "slurm"   # local | modal | fal | slurm   (override: KBENCH_BACKEND)
+gpu = "GB200"
+gpu_count = 4
+timeout_s = 1800
+
+[remote.slurm]
+jobid = ""                      # override: KBENCH_SLURM_JOBID
+image = "/mnt/lustre01/users/me/images/runner.sqsh"   # override: KBENCH_SLURM_IMAGE
+# host:container[:flags], as pyxis takes them. Every path crossing into the job is
+# translated through this map, so mount everything the run touches.
+mounts = [
+  "/mnt/lustre01/users/me:/lustre_home",
+  "/mnt/numa1/users/me:/scratch",
+]
+# Shared scratch for the kbench package and the job payload. Must be under a mount.
+stage = "/mnt/lustre01/users/me/kbench-stage"
+# Container-side interpreter. The image is not built here, so this must already have
+# flashinfer-bench; a venv on the shared filesystem is the usual way to get it.
+python = "/lustre_home/envs/kbench/bin/python3"
+cpus = 16                       # without this pyxis gets 1 CPU and dies
+# gpus defaults to remote.gpu_count
+# args = ["--container-env=..."]   # escape hatch for extra srun flags
+# export defaults to NVIDIA_VISIBLE_DEVICES/NVIDIA_DRIVER_CAPABILITIES, which a non-NGC
+# image needs or enroot's nvidia hook never fires and the container sees zero GPUs.
+
+[remote.image]
+# The .sqsh is prebuilt, so apt/pip/run are ignored here — only env is applied, by hand
+# at run time, exactly as on the local backend.
+base = ""
+
+[remote.image.env]
+# Compilation caches belong on node-local scratch; on a shared filesystem they contend.
+TRITON_CACHE_DIR = "/scratch/triton"
+TORCHINDUCTOR_CACHE_DIR = "/scratch/inductor"
+
+[remote.data]
+path = "/lustre_home/flashinfer-trace"   # the trace set, as the container sees it
+
+[bench]
+warmup_runs = 3
+iterations = 100
+num_trials = 5
+profile_baseline = false

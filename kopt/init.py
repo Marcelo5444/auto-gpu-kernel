@@ -106,7 +106,7 @@ source_dir = "{source_dir}"
 entry_point = "{kernel_file}::kernel"
 
 [remote]
-backend = "{backend}"   # local | modal | fal   (override: KBENCH_BACKEND)
+backend = "{backend}"   # local | modal | fal | slurm   (override: KBENCH_BACKEND)
 gpu = "{gpu}"
 gpu_count = 1
 timeout_s = 1800
@@ -200,6 +200,7 @@ def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
     """
     import tomllib
 
+    from kbench import task
     from kbench.config import _load_task
 
     # `work/` is gitignored, so projects there stay invisible to the framework-integrity
@@ -264,7 +265,7 @@ def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
         "## The user's brief\n\n"
         f"**Task:** `{cfg.name}`\n\n"
         f"**Target repository:** `{cfg.workdir}/` ({origin})\n\n"
-        f"**Hardware:** {cfg.gpus}x {cfg.gpu}, local\n\n"
+        f"**Hardware:** {cfg.gpus}x {cfg.gpu}, {task.runner_name(cfg)}\n\n"
         f"### Objective\n\n{cfg.objective}\n\n"
         f"### How to measure\n\n{cfg.measure}\n\n"
         f"### How to validate\n\n{cfg.validate}\n\n"

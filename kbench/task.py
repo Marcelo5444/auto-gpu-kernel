@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from kbench import slurm
 from kbench.config import TaskConfig
 
 VALIDATE_SCRIPT = "validate.py"
@@ -182,6 +183,42 @@ def _env(cfg: TaskConfig, extra: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
+def _script_cmd(
+    cfg: TaskConfig,
+    script: Path,
+    work: Path,
+    mode: str,
+    output: Path,
+) -> list[str]:
+    """The local interpreter, or the same argv re-entered into an srun container.
+
+    Paths go through the mount map rather than being reused as-is: the driving machine's
+    view of the project is not the container's.
+    """
+    runner = slurm.spec(cfg.slurm, cfg.gpus)
+    path = str if runner is None else runner.container_path
+    argv = [
+        sys.executable if runner is None else runner.python,
+        path(script),
+        "--repo",
+        path(work),
+        "--mode",
+        mode,
+        "--output",
+        path(output),
+    ]
+    return argv if runner is None else runner.command(argv, workdir=path(work))
+
+
+def runner_name(cfg: TaskConfig) -> str:
+    return "slurm" if slurm.spec(cfg.slurm, cfg.gpus) is not None else "local"
+
+
+def provenance(cfg: TaskConfig) -> str:
+    """Where the numbers came from. Measurements only compare within one of these."""
+    return f"{runner_name(cfg)} / {cfg.gpu} x{cfg.gpus}"
+
+
 def _run_script(
     cfg: TaskConfig,
     script: Path,
@@ -193,16 +230,7 @@ def _run_script(
     append: bool,
     extra_env: dict[str, str] | None,
 ) -> tuple[int, float]:
-    cmd = [
-        sys.executable,
-        str(script),
-        "--repo",
-        str(work),
-        "--mode",
-        mode,
-        "--output",
-        str(output),
-    ]
+    cmd = _script_cmd(cfg, script, work, mode, output)
     print(f"[kbench] {script.stem}: {shlex.join(cmd)}")
     started = time.monotonic()
     timed_out = False

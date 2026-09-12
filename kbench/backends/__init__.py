@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-BACKENDS = ("local", "modal", "fal")
+BACKENDS = ("local", "modal", "fal", "slurm")
 
 
 def get(name: str):
@@ -18,4 +18,8 @@ def get(name: str):
         from . import fal as fal_backend
 
         return fal_backend
+    if name == "slurm":
+        from . import slurm as slurm_backend
+
+        return slurm_backend
     raise SystemExit(f"unknown backend {name!r} (expected one of {', '.join(BACKENDS)})")

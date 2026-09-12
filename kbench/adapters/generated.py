@@ -33,7 +33,7 @@ class GeneratedTaskAdapter(BenchmarkAdapter):
             lower_is_better=result.lower_is_better,
             samples=result.samples,
             validation=result.validation_status,
-            provenance=f"local / {self.cfg.gpu} x{self.cfg.gpus}",
+            provenance=task.provenance(self.cfg),
             candidate_rev=result.workdir_rev,
             harness_rev=result.harness_rev,
             artifacts=result.out_dir,

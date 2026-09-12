@@ -8,7 +8,7 @@ source_dir = "triton"
 entry_point = "solution_fused.py::kernel"
 
 [remote]
-backend = "modal"   # local | modal | fal   (override: KBENCH_BACKEND)
+backend = "modal"   # local | modal | fal | slurm   (override: KBENCH_BACKEND)
 gpu = "B200"
 gpu_count = 1
 timeout_s = 1800
