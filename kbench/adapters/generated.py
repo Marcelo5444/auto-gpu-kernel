@@ -74,8 +74,5 @@ class GeneratedTaskAdapter(BenchmarkAdapter):
     def print_ab(self, a: Measurement, b: Measurement) -> None:
         task.print_ab(self.cfg, a.native, b.native, a.candidate)
 
-    def record(self, result: Measurement) -> None:
-        task.record(self.cfg, result.native)
-
     def serialize(self, result: Measurement) -> dict:
         return asdict(result.native)

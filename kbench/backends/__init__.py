@@ -1,4 +1,4 @@
-"""Backends all expose: run(cfg, payload) -> {label: {workload_id: result_dict}}."""
+"""Backends all expose: run(cfg, payload) -> {label: list[WorkloadResult]}."""
 
 from __future__ import annotations
 

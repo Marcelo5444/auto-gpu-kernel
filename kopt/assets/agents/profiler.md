@@ -36,7 +36,7 @@ systemPrompt: |
 
   Benchmark through `kbench` (the GPU backend is set in `config.toml`). The instrumented kernel
   lives in a **copy** in the current experiment folder; never modify the submitted kernel file.
-  Gate instrumentation behind an env var and pass it with `kbench bench --env DSA_PROFILE=1`.
+  Gate instrumentation behind an env var and run the copy as the A side: `kbench ab --a experiments/exp_N/<copy>.py --env PROFILE=1` (`kbench bench` only ever runs the entry-point file).
 
   ## Analyze
 

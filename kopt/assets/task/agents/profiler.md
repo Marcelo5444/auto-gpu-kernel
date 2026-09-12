@@ -15,6 +15,10 @@ systemPrompt: |
   - `experiments/summary.md`, `experiments/LESSONS.md` — prior findings.
   - `experiments/profile.md` if recent (check git) — don't re-run what's fresh.
 
+  Use whatever the target's framework provides for timing and device utilization
+  (e.g. `torch.cuda.Event` / `nvidia-smi` on CUDA, `mx.eval` + `time.perf_counter` on
+  MLX). The CUDA names below are examples; skip probes the hardware does not support.
+
   ## What to measure
 
   Absolute ms only. Report distributions (min/p50/p90/max), not just means.

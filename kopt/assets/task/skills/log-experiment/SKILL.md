@@ -26,13 +26,18 @@ create the next numbered folder. Never overwrite an existing `result.md`.
    - sample distribution when present;
    - A/B baseline, delta, and whether lower or higher is better;
    - what was learned and what to try next.
-4. Append one terse row to `experiments/summary.md` with the candidate and harness
-   revisions. Add durable findings to `experiments/LESSONS.md`.
+4. Append one terse row to `experiments/summary.md` (columns: Exp, Date, Description,
+   Metric, Pass, Mode, Candidate, Harness, Notes). Add durable findings to
+   `experiments/LESSONS.md`.
 
 ## Commit in the right place
 
 - Target-source experiment: commit changed target files in `<workdir>/` with an
-  `exp_N:` message and push the configured work branch. Never force-push.
+  `exp_N:` message, then write the resulting commit SHA into `result.md` and the
+  summary row's Candidate column — that SHA is what `kbench ab --a <ref>` takes
+  (kbench's pre-commit `HEAD+hash` candidate id is not a checkable ref). Push the
+  configured work branch only when the clone has a remote (`git remote` is non-empty);
+  if the push fails, note it in `result.md` and continue. Never force-push.
 - Harness or instruction experiment: commit `harness/` and `.omp/` in the outer project.
 - Commit `experiments/` in the outer project for every attempt.
 

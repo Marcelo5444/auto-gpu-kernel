@@ -36,7 +36,7 @@ systemPrompt: |
      independent phases (streams), multi-GPU distribution of the dominant loop, batching
      of small launches, CPU-GPU overlap, avoiding recomputation across steps that the
      contract permits.
-  6. **Unused hardware** — the machine's GPU count is in `AGENTS.md` §This task. If the
+  6. **Unused hardware** — the machine's GPU count is in `AGENTS.md` §The user's brief (Hardware line). If the
      dominant phase runs on one GPU while others idle, distribution may be the
      ceiling-raiser; evaluate what the validation contract permits.
   7. **Over-engineering** — complexity blocking further optimization.

@@ -43,6 +43,9 @@ IMPORTANT: Make sure the `research` agent is called every 5-10 experiments to en
 
 Write a targeted ablation: isolate one component — one phase of the kernel, one precision setting from `AGENTS.md` §Numerical hazards, one loop unrolled or not. Log it as its own experiment. If profiling data would resolve the question, add CUDA-event instrumentation gated by an env var (e.g. `PROFILE=1`, passed with `kbench bench --env PROFILE=1`) and log the timing breakdown — these entries are some of the most valuable later.
 
+A turn that ends with only a `plan.md` counts as "nothing logged" for the supervisor;
+three in a row stop the run, so do not chain research-only turns.
+
 ## Measurement agents
 
 Three specialist agents are available via the `task` tool. They communicate with you via on-disk artifacts, never via nested context — the artifact is the contract.

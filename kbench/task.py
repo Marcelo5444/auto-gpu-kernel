@@ -16,18 +16,19 @@ import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from kbench.config import TaskConfig
 
-
 VALIDATE_SCRIPT = "validate.py"
 BENCHMARK_SCRIPT = "benchmark.py"
 PREPARED_FILE = "prepared.json"
 MODES = ("quick", "full")
 TIMEOUT_S = {"quick": 1800, "full": 3600}
+TIMEOUT_EXIT = 124
 
 
 @dataclass
@@ -56,49 +57,40 @@ class TaskResult:
         )
 
 
+def git_state(work: Path) -> tuple[str, str, str]:
+    """(HEAD sha, porcelain status, sha256 of the dirty state incl. untracked files).
+
+    Raises OSError/CalledProcessError when ``work`` is not a usable git repository.
+    """
+    def run(*args, **kw):
+        return subprocess.run(
+            ["git", *args], cwd=work, capture_output=True, check=True, **kw
+        ).stdout
+
+    head = run("rev-parse", "HEAD", text=True).strip()
+    status = run("status", "--porcelain=v1", "--untracked-files=all", text=True)
+    diff = run("diff", "--binary", "HEAD")
+    untracked = run("ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
+    digest = hashlib.sha256(diff)
+    digest.update(status.encode())
+    for raw_path in sorted(path for path in untracked if path):
+        path = work / os.fsdecode(raw_path)
+        digest.update(len(raw_path).to_bytes(4, "big"))
+        digest.update(raw_path)
+        if path.is_symlink():
+            digest.update(os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            digest.update(path.read_bytes())
+    return head, status, digest.hexdigest()
+
+
 def workdir_rev(work: Path) -> str:
-    """HEAD sha + dirty state hash, so a result identifies the candidate it ran."""
+    """Short HEAD sha, plus a dirty-state hash, so a result identifies the candidate it ran."""
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "--short=12", "HEAD"],
-            cwd=work,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        diff = subprocess.run(
-            ["git", "diff", "--binary", "HEAD"],
-            cwd=work,
-            capture_output=True,
-            check=True,
-        ).stdout
-        status = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"],
-            cwd=work,
-            capture_output=True,
-            check=True,
-        ).stdout
-        untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-            cwd=work,
-            capture_output=True,
-            check=True,
-        ).stdout.split(b"\0")
-        if diff or status:
-            digest = hashlib.sha256(diff)
-            digest.update(status)
-            for raw_path in sorted(path for path in untracked if path):
-                path = work / os.fsdecode(raw_path)
-                digest.update(len(raw_path).to_bytes(4, "big"))
-                digest.update(raw_path)
-                if path.is_symlink():
-                    digest.update(os.fsencode(os.readlink(path)))
-                elif path.is_file():
-                    digest.update(path.read_bytes())
-            return f"{head}+{digest.hexdigest()[:8]}"
-        return head
+        head, status, digest = git_state(work)
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
+    return f"{head[:12]}+{digest[:8]}" if status else head[:12]
 
 
 def harness_dir(cfg: TaskConfig) -> Path:
@@ -181,6 +173,8 @@ def _env(cfg: TaskConfig, extra: dict[str, str] | None) -> dict[str, str]:
     if cfg.path_prepend:
         env["PATH"] = f"{cfg.path_prepend}:{env.get('PATH', '')}"
     env.setdefault("CUDA_VISIBLE_DEVICES", ",".join(str(i) for i in range(cfg.gpus)))
+    # Bytecode written into the target repo would register as a candidate change.
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env["KBENCH_ROOT"] = str(cfg.root)
     env["KBENCH_HARNESS"] = str(harness_dir(cfg))
     env.update(cfg.env)
@@ -231,8 +225,6 @@ def _run_script(
             except OSError:
                 proc.kill()
 
-        import threading
-
         watchdog = threading.Timer(TIMEOUT_S[mode], kill)
         watchdog.start()
         try:
@@ -250,7 +242,7 @@ def _run_script(
                 proc.stdout.close()
         if timed_out:
             print(f"[kbench] KILLED: {script.name} exceeded {TIMEOUT_S[mode]}s")
-            exit_code = exit_code or 124
+            exit_code = TIMEOUT_EXIT
     return exit_code, time.monotonic() - started
 
 
@@ -319,7 +311,6 @@ def run_mode(
 ) -> TaskResult:
     if mode not in MODES:
         raise SystemExit(f"unknown task mode {mode!r}; choose quick or full")
-    ensure_harness(cfg)
     work = workdir or cfg.work
     if not work.exists():
         raise SystemExit(f"workdir not found: {work}")
@@ -347,19 +338,21 @@ def run_mode(
         extra_env=extra_env,
     )
     validation, validation_error = _read_object(validation_path, "validation")
-    if validate_exit != 0:
+    if validate_exit == TIMEOUT_EXIT:
+        validation_status = f"FAIL: validate.py timed out after {TIMEOUT_S[mode]}s"
+    elif validation is not None and validation.get("passed") is not True:
+        # The contract asks the script to write its diagnosis even when it fails.
+        validation_status = f"FAIL: {validation.get('details', 'reported passed=false')}"
+    elif validate_exit != 0:
         validation_status = f"FAIL: validate.py exited {validate_exit}"
     elif validation_error:
         validation_status = f"FAIL: {validation_error}"
-    elif validation.get("passed") is not True:
-        detail = validation.get("details", "reported passed=false")
-        validation_status = f"FAIL: {detail}"
     else:
         validation_status = "pass"
 
     result = TaskResult(
         mode=mode,
-        exit_code=validate_exit if validate_exit else (0 if validation_status == "pass" else 1),
+        exit_code=0 if validation_status == "pass" else (validate_exit or 1),
         seconds_wall=time.monotonic() - started,
         validation_status=validation_status,
         out_dir=str(out),
@@ -432,39 +425,6 @@ def print_result(cfg: TaskConfig, result: TaskResult) -> None:
     print(f"  artifacts: {result.out_dir}")
 
 
-def record(cfg: TaskConfig, result: TaskResult) -> None:
-    """Append to the same .kopt/bench.jsonl timeline kernel mode uses."""
-    try:
-        entry = {
-            "t": time.time(),
-            "mode": result.mode,
-            "kernel": result.workdir_rev,
-            "harness": result.harness_rev,
-            "definition": cfg.name,
-            "backend": "local",
-            "gpu": f"{cfg.gpu} x{cfg.gpus}",
-            "num_workloads": 1,
-            "num_passed": 1 if result.passed else 0,
-            "passed": result.passed,
-            "validation": result.validation_status,
-            "error": result.error,
-            "metric_value": result.value,
-            "metric": result.unit,
-            "lower_is_better": result.lower_is_better,
-            "samples": result.samples,
-            "sample_mean": statistics.fmean(result.samples) if result.samples else None,
-            "sample_median": statistics.median(result.samples) if result.samples else None,
-            "sample_min": min(result.samples) if result.samples else None,
-            "sample_max": max(result.samples) if result.samples else None,
-        }
-        path = cfg.root / ".kopt" / "bench.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
-            handle.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
-
-
 def run_ab(
     cfg: TaskConfig,
     a_ref: str,
@@ -524,7 +484,8 @@ def print_ab(cfg: TaskConfig, a: TaskResult, b: TaskResult, a_label: str) -> Non
     if a.unit != b.unit or a.lower_is_better != b.lower_is_better:
         print("\n  REFUSED: A and B reported incompatible metrics")
         return
-    if a.value is None or b.value is None or a.value == 0:
+    if a.value == 0:
+        print("\n  no comparable measurements")
         return
     delta = b.value - a.value
     pct = 100.0 * delta / abs(a.value)

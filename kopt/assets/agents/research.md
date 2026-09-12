@@ -33,7 +33,7 @@ systemPrompt: |
   5. **Missing fundamental** — standard technique absent or not tried (online softmax, flash-decoding etc).
   6. **Over-engineering** — complexity blocking further optimization.
   7. **Ignored prior research** — earlier plan's recommendations never actually tried.
-  8. **Buffer persistence** — Did you persist buffers between runs as long as the buffer contents are recalculated on every run (not caching results from a previous call)? For example, it is possible to eliminate `torch.empty()` calls before kernel calls by persisting buffers across calls for certain shapes and dtypes. This is a common optimization that can be easily overlooked.
+  8. **Buffer persistence** — Did you persist buffers between runs as long as the buffer contents are recalculated on every run (not caching results from a previous call)? For example, it is possible to eliminate `torch.empty()` calls before kernel calls by persisting scratch buffers across calls for certain shapes and dtypes — scratch only; never cache inputs, outputs, or pointers (AGENTS.md no-gaming rules). This is a common optimization that can be easily overlooked.
   9. **Overlooked shortcuts** — check if input shape makes the kernel trivial. Examples: softmax over a size-1 axis is always 1.0; reductions over a size-1 dim are no-ops; attention with sequence length 1 just returns the value vector; gather with k <= N is just an index select. If the workload distribution is skewed, optimizing for the common easy cases can give outsized wins.
 
   ## Research

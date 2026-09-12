@@ -19,7 +19,6 @@ from kbench.task import harness_rev, run_ab, run_mode, workdir_rev
 from kopt.cli import _git_state, _prepare_task
 from kopt.init import init_task
 
-
 VALIDATE = """\
 import argparse
 import json
@@ -140,8 +139,20 @@ gpu = "test-gpu"
         (cfg.work / "answer.txt").write_text("wrong\n")
         result = run_mode(cfg, "full")
         self.assertFalse(result.passed)
-        self.assertIn("validate.py exited", result.validation_status)
+        # The script's own diagnosis wins over its non-zero exit code.
+        self.assertEqual(result.validation_status, "FAIL: full")
+        self.assertEqual(result.exit_code, 1)
         self.assertFalse((Path(result.out_dir) / "benchmark.json").exists())
+
+    def test_validation_timeout_is_reported_as_such(self) -> None:
+        cfg = load(self.root)
+        assert isinstance(cfg, TaskConfig)
+        (self.root / "harness" / "validate.py").write_text("import time; time.sleep(30)\n")
+        with patch.dict("kbench.task.TIMEOUT_S", {"quick": 1, "full": 1}):
+            result = run_mode(cfg, "quick")
+        self.assertFalse(result.passed)
+        self.assertEqual(result.exit_code, 124)
+        self.assertIn("timed out after 1s", result.validation_status)
 
     def test_kbench_rejects_an_invalid_benchmark_contract(self) -> None:
         cfg = load(self.root)
@@ -342,6 +353,55 @@ gpu = "test-gpu"
             check=True, capture_output=True, text=True,
         ).stdout
         self.assertEqual(status, "")
+
+    def test_init_task_snapshots_a_plain_directory(self) -> None:
+        source = self.root / "plain"
+        source.mkdir()
+        (source / "answer.txt").write_text("42\n")
+        (source / "__pycache__").mkdir()
+        (source / "__pycache__" / "junk.pyc").write_bytes(b"")
+        spec = self.root / "specs" / "path.toml"
+        spec.parent.mkdir()
+        spec.write_text(
+            """
+[task]
+name = "path-demo"
+objective = "Make it faster."
+measure = "Measure wall time; lower is better."
+validate = "Preserve the answer."
+
+[task.repo]
+path = "../plain"
+
+[task.hardware]
+gpus = 1
+gpu = "test-gpu"
+""".lstrip()
+        )
+        project = self.root / "snapshot"
+        init_task(project, spec)
+
+        work = project / "repo"
+        self.assertEqual((work / "answer.txt").read_text(), "42\n")
+        self.assertFalse((work / "__pycache__").exists())
+        subject = subprocess.run(
+            ["git", "log", "-1", "--format=%s"], cwd=work,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(subject, "baseline")
+        self.assertEqual(_git_state(work)[1], "")
+        self.assertIn("no remote", (project / ".omp" / "AGENTS.md").read_text())
+
+    def test_repo_needs_url_or_path_but_not_both(self) -> None:
+        text = (self.root / "config.toml").read_text()
+        (self.root / "config.toml").write_text(text.replace('url = ', 'path = "x"\nurl = '))
+        with self.assertRaisesRegex(SystemExit, "not both"):
+            load(self.root)
+        (self.root / "config.toml").write_text(
+            text.replace('url = "https://example.invalid/demo.git"\n', "")
+        )
+        with self.assertRaisesRegex(SystemExit, "url or task.repo.path"):
+            load(self.root)
 
     def test_first_run_builds_both_baselines_and_commits(self) -> None:
         spec = self.root / "automatic.toml"

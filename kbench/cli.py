@@ -20,7 +20,7 @@ def _env(pairs: list[str] | None) -> dict[str, str]:
 
 
 def _request(args) -> RunRequest:
-    mode = getattr(args, "mode", None)
+    mode = args.mode
     if not mode:
         mode = "quick" if args.quick else "stride" if args.stride > 1 else "full"
     return RunRequest(

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import tomllib
 
 
 @dataclass(frozen=True)
@@ -45,8 +44,9 @@ class TaskConfig:
     validate: str
     hints: str
     workdir: str
-    # [task.repo]
+    # [task.repo] — exactly one of url (git clone) or path (copy a local directory)
     repo_url: str
+    repo_path: str
     branch: str
     base: str
     # [task.hardware]
@@ -55,8 +55,6 @@ class TaskConfig:
     # [task.env]
     env: dict[str, str]
     path_prepend: str
-
-    backend: str = "local"  # provenance label; task mode always runs locally
 
     @property
     def work(self) -> Path:
@@ -71,8 +69,8 @@ def _load_task(root: Path, raw: dict) -> TaskConfig:
     resolved_work = (root / workdir).resolve()
     if resolved_work == root.resolve() or not resolved_work.is_relative_to(root.resolve()):
         raise SystemExit("config.toml: task.workdir must be a child of the task project")
-    objective = task.get("objective", task.get("description", "")).strip()
-    measure = task.get("measure", task.get("metric", "")).strip()
+    objective = task.get("objective", "").strip()
+    measure = task.get("measure", "").strip()
     validate = task.get("validate", "").strip()
     missing = [
         name
@@ -81,12 +79,14 @@ def _load_task(root: Path, raw: dict) -> TaskConfig:
             ("task.objective", objective),
             ("task.measure", measure),
             ("task.validate", validate),
-            ("task.repo.url", repo.get("url")),
+            ("task.repo.url or task.repo.path", repo.get("url") or repo.get("path")),
         )
         if not value
     ]
     if missing:
         raise SystemExit(f"config.toml: missing {', '.join(missing)}")
+    if repo.get("url") and repo.get("path"):
+        raise SystemExit("config.toml: task.repo needs either url or path, not both")
 
     return TaskConfig(
         root=root,
@@ -97,6 +97,7 @@ def _load_task(root: Path, raw: dict) -> TaskConfig:
         hints=task.get("hints", "").strip(),
         workdir=workdir,
         repo_url=repo.get("url", ""),
+        repo_path=repo.get("path", ""),
         branch=repo.get("branch", ""),
         base=repo.get("base", "main"),
         gpus=int(hw.get("gpus", 1)),
@@ -154,6 +155,7 @@ def load(root: Path | None = None) -> Config | TaskConfig:
     if "kernel" not in raw:
         raise SystemExit(f"{path}: missing [kernel] or [task] section")
     kernel = raw["kernel"]
+    language = kernel.get("language", "triton")
     remote = raw.get("remote", {})
     img = remote.get("image", {})
     data = remote.get("data", {})
@@ -161,8 +163,8 @@ def load(root: Path | None = None) -> Config | TaskConfig:
     return Config(
         root=root,
         definition=kernel["definition"],
-        language=kernel.get("language", "triton"),
-        source_dir=kernel.get("source_dir", kernel.get("language", "triton")),
+        language=language,
+        source_dir=kernel.get("source_dir", language),
         entry_point=kernel["entry_point"],
         backend=os.environ.get("KBENCH_BACKEND") or remote.get("backend", "local"),
         gpu=remote.get("gpu", "B200"),

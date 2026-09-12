@@ -14,8 +14,10 @@ repository-specific validation and measurement adapters.
   avoid mixing it with a target-source optimization.
 - Harness changes may fix measurement, improve repeatability, or strengthen coverage.
   Never weaken validation to make a candidate pass or special-case benchmark inputs.
-- Every result carries a harness revision. Do not compare numbers from different
-  revisions without rerunning the candidates with the same current harness.
+- Every result carries a harness revision, hashed from every file under `harness/`
+  (including `README.md`). Do not compare numbers from different revisions without
+  rerunning the candidates with the same current harness; batch doc edits with a
+  harness experiment rather than sprinkling them.
 - Log every experiment via `/skill:log-experiment`, including failures.
 - After logging one experiment, end the turn. The supervisor starts the next iteration.
 - Do not ask the user questions. Work from the local repository and its documentation.

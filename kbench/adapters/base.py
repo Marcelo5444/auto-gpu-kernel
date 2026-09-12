@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import statistics
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-import statistics
 from pathlib import Path
 from typing import Any
 

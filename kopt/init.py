@@ -14,6 +14,13 @@ import subprocess
 from pathlib import Path
 
 ASSETS = Path(__file__).parent / "assets"
+GIT_IDENT = ["-c", "user.email=kopt@localhost", "-c", "user.name=kopt"]
+
+LESSONS = (
+    "# Lessons\n\n"
+    "Durable cross-experiment findings. Append when a lesson recurs. Remove entries\n"
+    "that later turn out to be wrong — a stale lesson blocks a good idea forever.\n"
+)
 
 # Language profile -> (flashinfer-bench BuildSpec language, source directory).
 # These differ for CuTeDSL: it is Python-JIT so it packs with the triton builder,
@@ -133,28 +140,56 @@ profile_baseline = false
 """
 
 
-def _git_init(project: Path) -> None:
+def _git_init(project: Path, ignore: str) -> None:
     """Make the project its own repo.
 
     AGENTS.md tells the agent to commit after each logged experiment. Without a repo
     here, `git commit` walks up to whatever repo contains the project and commits
     unrelated work — so the scaffold owns its own history.
     """
-    (project / ".gitignore").write_text(".kopt/\n__pycache__/\n*.log\nresults.json\n")
-    ident = ["-c", "user.email=kopt@localhost", "-c", "user.name=kopt"]
+    if (project / ".git").exists():
+        return
+    # `/*.log` ignores only the root-level tee target; experiments/exp_N/bench.log is
+    # evidence and must be committed.
+    (project / ".gitignore").write_text(ignore + ".kopt/\n.kbench/\n__pycache__/\n/*.log\n")
     try:
-        for cmd in (
-            ["git", "init", "-q"],
-            ["git", "add", "-A"],
-            ["git", *ident, "commit", "-q", "-m", "scaffold"],
-        ):
-            subprocess.run(cmd, cwd=project, check=True, capture_output=True)
+        for cmd in (["init", "-q"], ["add", "-A"], [*GIT_IDENT, "commit", "-q", "-m", "scaffold"]):
+            _run_git(cmd, project)
     except (OSError, subprocess.CalledProcessError) as exc:
         print(f"  warning: could not init git repo ({exc}); agent commits may escape")
 
 
+def _seed_experiments(project: Path, summary_header: str) -> None:
+    """The optimize skill reads both index files on its first step; seed them so a
+    fresh run does not open with two failed reads."""
+    experiments = project / "experiments"
+    experiments.mkdir(exist_ok=True)
+    (experiments / "summary.md").write_text(f"# Experiment index\n\n{summary_header}")
+    (experiments / "LESSONS.md").write_text(LESSONS)
+
+
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _copy_local_repo(source: Path, work: Path) -> None:
+    """Snapshot a plain directory into ``work`` as a fresh git repo.
+
+    Used for `[task.repo] path`: small in-tree examples that are not repositories of
+    their own. The copy gets one "baseline" commit so kbench provenance, A/B refs, and
+    the agent's per-experiment commits work exactly as they do for a clone.
+    """
+    if not source.is_dir():
+        raise SystemExit(f"task.repo.path is not a directory: {source}")
+    print(f"  copying {source} -> {work}")
+    shutil.copytree(
+        source,
+        work,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache", ".DS_Store"),
+    )
+    for cmd in (["init", "-q", "-b", "main"], ["add", "-A"],
+                [*GIT_IDENT, "commit", "-q", "-m", "baseline"]):
+        _run_git(cmd, work)
 
 
 def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
@@ -167,27 +202,35 @@ def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
 
     from kbench.config import _load_task
 
+    # `work/` is gitignored, so projects there stay invisible to the framework-integrity
+    # checks in `kopt run`; anywhere else inside the checkout would trip them.
     source_checkout = Path(__file__).resolve().parents[1]
+    work_root = source_checkout / "work"
     resolved_project = project.resolve()
-    if resolved_project == source_checkout or resolved_project.is_relative_to(source_checkout):
+    under_work = resolved_project != work_root and resolved_project.is_relative_to(work_root)
+    if resolved_project.is_relative_to(source_checkout) and not under_work:
         raise SystemExit(
-            "task projects must live outside the auto-gpu-kernel source checkout; "
-            "choose a separate work directory"
+            "task projects inside the auto-gpu-kernel checkout must live under work/"
         )
     if project.exists() and any(project.iterdir()) and not force:
         raise SystemExit(f"{project} exists and is not empty (use --force)")
-    project.mkdir(parents=True, exist_ok=True)
 
     spec_text = Path(taskspec).read_text()
+    cfg = _load_task(project, tomllib.loads(spec_text))  # validate before touching disk
+    project.mkdir(parents=True, exist_ok=True)
     (project / "config.toml").write_text(spec_text)
-    cfg = _load_task(project, tomllib.loads(spec_text))
 
-    # --- clone the target repo on its work branch -------------------------
+    # --- clone (or copy) the target repo on its work branch ----------------
     work = cfg.work
-    if not work.exists():
+    if cfg.repo_path:
+        if not work.exists():
+            _copy_local_repo(Path(taskspec).resolve().parent / cfg.repo_path, work)
+        if cfg.branch:
+            _run_git(["checkout", "-B", cfg.branch], work)
+    elif not work.exists():
         print(f"  cloning {cfg.repo_url} -> {work}")
         subprocess.run(["git", "clone", cfg.repo_url, str(work)], check=True)
-    if cfg.branch:
+    if cfg.repo_url and cfg.branch:
         remote = subprocess.run(
             ["git", "ls-remote", "--heads", "origin", cfg.branch],
             cwd=work, capture_output=True, text=True, check=True,
@@ -203,26 +246,24 @@ def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
             if push.returncode != 0:
                 print(f"  warning: could not push work branch: {push.stderr.strip()}")
 
-    experiments = project / "experiments"
-    experiments.mkdir(exist_ok=True)
-    (experiments / "summary.md").write_text(
-        "# Experiment index\n\n"
-        "| Exp | Date | Description | Metric | Pass | Mode | Notes |\n"
-        "|---|---|---|---|---|---|---|\n"
-    )
-    (experiments / "LESSONS.md").write_text(
-        "# Lessons\n\n"
-        "Durable cross-experiment findings. Append when a lesson recurs. Remove entries\n"
-        "that later turn out to be wrong — a stale lesson blocks a good idea forever.\n"
+    _seed_experiments(
+        project,
+        "| Exp | Date | Description | Metric | Pass | Mode | Candidate | Harness | Notes |\n"
+        "|---|---|---|---|---|---|---|---|---|\n",
     )
 
     # --- agent home --------------------------------------------------------
     omp = project / ".omp"
     omp.mkdir(exist_ok=True)
+    origin = (
+        "local snapshot, no remote — commit but never push"
+        if cfg.repo_path
+        else f"branch `{cfg.branch or cfg.base}`"
+    )
     task_section = (
         "## The user's brief\n\n"
         f"**Task:** `{cfg.name}`\n\n"
-        f"**Target repository:** `{cfg.workdir}/` (branch `{cfg.branch or cfg.base}`)\n\n"
+        f"**Target repository:** `{cfg.workdir}/` ({origin})\n\n"
         f"**Hardware:** {cfg.gpus}x {cfg.gpu}, local\n\n"
         f"### Objective\n\n{cfg.objective}\n\n"
         f"### How to measure\n\n{cfg.measure}\n\n"
@@ -242,17 +283,7 @@ def init_task(project: Path, taskspec: Path, force: bool = False) -> Path:
 
     # Project-level repo owns the generated harness and experiment history. The target
     # clone is ignored and manages its own commits independently.
-    if not (project / ".git").exists():
-        (project / ".gitignore").write_text(
-            f"{cfg.workdir}/\n.kopt/\n.kbench/\n__pycache__/\n*.log\nresults.json\n"
-        )
-        ident = ["-c", "user.email=kopt@localhost", "-c", "user.name=kopt"]
-        try:
-            for cmd in (["init", "-q"], ["add", "-A"],
-                        [*ident, "commit", "-q", "-m", "scaffold"]):
-                _run_git(cmd, project)
-        except (OSError, subprocess.CalledProcessError) as exc:
-            print(f"  warning: could not init project repo ({exc})")
+    _git_init(project, ignore=f"{cfg.workdir}/\n")
     return project
 
 
@@ -278,21 +309,12 @@ def init(
 
     omp = project / ".omp"
     src = project / "solution" / source_dir
-    experiments = project / "experiments"
-    for d in (omp, src, experiments):
+    for d in (omp, src):
         d.mkdir(parents=True, exist_ok=True)
-
-    # Seed the index files. The optimize skill reads both on its first step, so
-    # without them every fresh run opens with two failed reads.
-    (experiments / "summary.md").write_text(
-        "# Experiment index\n\n"
+    _seed_experiments(
+        project,
         "| Exp | Date | Description | Latency | Ref | Pass | Backend | Notes |\n"
-        "|---|---|---|---|---|---|---|---|\n"
-    )
-    (experiments / "LESSONS.md").write_text(
-        "# Lessons\n\n"
-        "Durable cross-experiment findings. Append when a lesson recurs. Remove entries\n"
-        "that later turn out to be wrong — a stale lesson blocks a good idea forever.\n"
+        "|---|---|---|---|---|---|---|---|\n",
     )
 
     # AGENTS.md = generic core + language profile + generated kernel facts
@@ -327,5 +349,5 @@ def init(
             gpu=gpu,
         )
     )
-    _git_init(project)
+    _git_init(project, ignore="results.json\n")
     return project

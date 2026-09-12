@@ -41,6 +41,15 @@ It must accept exactly these common arguments:
 --output PATH
 ```
 
+Kbench runs both scripts with the candidate checkout as the working directory (the
+clone, or a temporary worktree during `kbench ab`) — always use `--repo`, never assume
+the clone path. It exports `KBENCH_ROOT` (the project) and `KBENCH_HARNESS` (the
+`harness/` directory); locate fixtures via `KBENCH_HARNESS`, never by relative path.
+Each script is killed after 30 minutes in quick mode and 60 minutes in full mode.
+Anything the scripts write into the candidate checkout that git does not already ignore
+(build outputs, caches; bytecode is already disabled) is detected as a candidate change
+and fails the run — keep scratch under `--output`'s directory or a temp dir.
+
 `quick` should be the cheapest reliable correctness gate. `full` should cover the
 behavior promised in the user's validation description. Write a JSON object to
 `--output`, even on failure:

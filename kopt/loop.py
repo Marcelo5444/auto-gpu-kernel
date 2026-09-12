@@ -10,12 +10,14 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from omp_rpc import RpcClient
 
 from kopt.record import Recorder, new_run_log
 
 DEFAULT_PROMPT = "/skill:optimize"
+LOG_PROMPT = "/skill:log-experiment"
 
 
 @dataclass
@@ -23,16 +25,26 @@ class Iteration:
     idx: int
     experiment: str | None
     """Experiment that gained a `result.md` during this turn, if any."""
+    benchmarks: int
+    """kbench runs recorded in .kopt/bench.jsonl during this turn."""
     cost: float
     tokens: int
     tool_calls: int
     seconds: float
     assistant_text: str
+    recovery: bool = False
+    """This turn was the one-off log-experiment prompt after an unlogged turn."""
+
+    @property
+    def unlogged(self) -> bool:
+        """Benchmarks ran but no experiment was logged — work without a record.
+        Usually the turn was cut short (context, --max-time) before log-experiment."""
+        return self.experiment is None and self.benchmarks > 0
 
     @property
     def stalled(self) -> bool:
-        """No experiment was logged, so the turn produced nothing durable."""
-        return self.experiment is None
+        """Nothing measurable happened: no experiment logged and no benchmark run."""
+        return self.experiment is None and self.benchmarks == 0
 
 
 @dataclass
@@ -53,6 +65,9 @@ class Loop:
     fresh: bool = False
     """Start a new omp session each iteration instead of persisting one."""
     history: list[Iteration] = field(default_factory=list)
+    _client: Any = field(default=None, init=False, repr=False)
+    _base: tuple[float, int, int] = field(default=(0.0, 0, 0), init=False, repr=False)
+    """Cumulative session (cost, tokens, tool_calls) at the start of the current turn."""
 
     # --- progress tracking ----------------------------------------------
     def _logged(self) -> set[str]:
@@ -70,6 +85,13 @@ class Loop:
             return set()
         return {p.parent.name for p in root.glob("exp_*/result.md")}
 
+    def _benchmarks(self) -> int:
+        path = self.project / ".kopt" / "bench.jsonl"
+        try:
+            return sum(1 for line in path.open() if line.strip())
+        except OSError:
+            return 0
+
     # --- reporting ------------------------------------------------------
     @property
     def spent(self) -> float:
@@ -81,7 +103,7 @@ class Loop:
         if self.budget is not None and self.spent >= self.budget:
             return f"reached budget ${self.budget:.2f} (spent ${self.spent:.2f})"
         recent = self.history[-3:]
-        if len(recent) == 3 and all(i.stalled for i in recent):
+        if len(recent) == 3 and all(i.experiment is None for i in recent):
             return "3 consecutive iterations logged no experiment"
         return None
 
@@ -113,11 +135,12 @@ class Loop:
         self._base = (stats.cost, stats.tokens.total, stats.tool_calls)
         return client
 
-    def _turn(self, idx: int, log: Recorder) -> Iteration:
-        client = self._client or self._connect(log)
+    def _turn(self, idx: int, log: Recorder, prompt: str) -> Iteration:
+        client = self._client if self._client is not None else self._connect(log)
         before = self._logged()
+        benchmarks_before = self._benchmarks()
         start = time.monotonic()
-        turn = client.prompt_and_wait(self.prompt, timeout=self.timeout)
+        turn = client.prompt_and_wait(prompt, timeout=self.timeout)
         elapsed = time.monotonic() - start
 
         # Stats are cumulative for the session; diff against the last turn.
@@ -128,6 +151,7 @@ class Loop:
         return Iteration(
             idx=idx,
             experiment=logged[-1] if logged else None,
+            benchmarks=max(0, self._benchmarks() - benchmarks_before),
             cost=stats.cost - cost,
             tokens=stats.tokens.total - tokens,
             tool_calls=stats.tool_calls - calls,
@@ -147,9 +171,6 @@ class Loop:
         log.write("run_start", project=str(self.project), model=self.model or "(default)",
                   thinking=self.thinking or "(default)", max_iterations=self.max_iterations,
                   budget=self.budget, fresh=self.fresh)
-        self._client = None
-        self._base = (0.0, 0, 0)
-
         try:
             while True:
                 if (reason := self._should_stop()) is not None:
@@ -163,35 +184,54 @@ class Loop:
                 if self.fresh:
                     self._close()
 
-                it = self._turn(idx, log)
+                # A turn that benchmarked but never logged (cut off before
+                # log-experiment) gets one recovery turn that only writes the record.
+                prompt = self.prompt
+                last = self.history[-1] if self.history else None
+                if last is not None and last.unlogged and not last.recovery:
+                    print(f"  previous turn ran {last.benchmarks} benchmark(s) but logged"
+                          " no experiment — asking for the record first")
+                    prompt = LOG_PROMPT
+
+                it = self._turn(idx, log, prompt)
+                it.recovery = prompt == LOG_PROMPT
                 if self._is_dead(it):
                     # Session expired (commonly --max-time). Reconnect and retry once;
                     # a fresh session still sees every experiment on disk.
                     print("  session ended — reconnecting")
                     log.write("reconnect", idx=idx)
                     self._close()
-                    it = self._turn(idx, log)
+                    it = self._turn(idx, log, prompt)
+                    it.recovery = prompt == LOG_PROMPT
                     if self._is_dead(it):
-                        reason = "omp unusable after reconnect"
-                        print(f"\nABORT: {reason}")
-                        log.write("run_end", reason=reason,
-                                  iterations=len(self.history), spent=self.spent)
-                        raise SystemExit(reason)
+                        raise SystemExit("omp unusable after reconnect")
 
                 self.history.append(it)
                 log.write("iteration", spent=self.spent, **asdict(it))
+                outcome = it.experiment or (
+                    f"UNLOGGED ({it.benchmarks} benchmark runs)"
+                    if it.unlogged
+                    else "NOTHING LOGGED"
+                )
                 print(
-                    f"  {it.experiment or 'NOTHING LOGGED'}"
+                    f"  {outcome}"
                     f" | {it.seconds:.0f}s | {it.tool_calls} tools"
                     f" | {it.tokens} tok | ${it.cost:.4f} (total ${self.spent:.4f})"
                 )
-                if it.assistant_text:
-                    print(f"  {it.assistant_text.strip().splitlines()[-1][:160]}")
+                if last := it.assistant_text.strip():
+                    print(f"  {last.splitlines()[-1][:160]}")
+        except BaseException as exc:
+            # Abort, timeout, RpcError, Ctrl-C: still close the log so `kopt watch`
+            # does not show the run as live forever.
+            reason = str(exc) if isinstance(exc, SystemExit) else f"error: {exc!r}"
+            print(f"\nABORT: {reason}")
+            log.write("run_end", reason=reason, iterations=len(self.history), spent=self.spent)
+            raise
         finally:
             self._close()
 
     def _close(self) -> None:
-        if getattr(self, "_client", None) is not None:
+        if self._client is not None:
             try:
                 self._client.stop()
             except Exception:

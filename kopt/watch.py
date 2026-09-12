@@ -1,7 +1,9 @@
-"""Viewer for a run: live log, optimization chart, and the experiments tree.
+"""Viewer for a project: one continuous log across all its runs, the optimization
+chart, and the experiments tree.
 
 Knows nothing about omp or the loop — it reads files. Start it before, during, or
-after a run; it replays what already happened, then follows.
+after a run; it replays every run so far, then follows the newest and rolls onto the
+next one when `kopt run` starts again.
 
 Stdlib only: SSE rather than WebSockets keeps this dependency-free, and browsers
 reconnect automatically.
@@ -19,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from kbench.history import kernel_digest
 from kbench.history import load as load_history
 from kopt import pages
-from kopt.record import latest_run_log, list_run_logs, runs_dir
+from kopt.record import list_run_logs, runs_dir
 
 # Only these are browsable, and only under experiments/.
 VIEWABLE = {".md", ".py", ".json", ".txt", ".log", ".toml", ".cu", ".cuh", ".jsonl"}
@@ -103,17 +105,17 @@ def _experiments(root: Path) -> list[dict]:
     return out
 
 
-def resolve(project: Path, run: str | None = None) -> Path | None:
-    """Pick which run to show: an explicit path/name, else the newest."""
-    if run:
-        candidate = Path(run)
-        if candidate.exists():
-            return candidate
-        named = runs_dir(project) / (run if run.endswith(".jsonl") else f"{run}.jsonl")
-        if named.exists():
-            return named
-        raise SystemExit(f"no such run: {run}")
-    return latest_run_log(project)
+def resolve(project: Path, run: str | None) -> Path | None:
+    """An explicitly pinned run log (path or name), else None = follow all runs."""
+    if not run:
+        return None
+    candidate = Path(run)
+    if candidate.exists():
+        return candidate
+    named = runs_dir(project) / (run if run.endswith(".jsonl") else f"{run}.jsonl")
+    if named.exists():
+        return named
+    raise SystemExit(f"no such run: {run}")
 
 
 def serve(project: Path, port: int = 8765, run: str | None = None,
@@ -121,17 +123,13 @@ def serve(project: Path, port: int = 8765, run: str | None = None,
     project = Path(project).resolve()
     experiments = (project / "experiments").resolve()
     pinned_log = resolve(project, run)
-    pinned = run is not None
 
-    def current_log() -> Path | None:
-        # Without an explicit run, keep resolving so `kopt watch` can start first.
-        return pinned_log if pinned else latest_run_log(project)
-
-    def run_by_name(name: str) -> Path | None:
-        """?run= comes from the browser: accept run-log *names* only, never paths."""
-        name = Path(name).name
-        target = runs_dir(project) / (name if name.endswith(".jsonl") else f"{name}.jsonl")
-        return target if target.is_file() else None
+    def run_logs() -> list[Path]:
+        """Every run of this project, oldest first — or just the pinned one."""
+        if pinned_log is not None:
+            return [pinned_log]
+        # Keep resolving so `kopt watch` can start before the first `kopt run`.
+        return list_run_logs(project)
 
     def safe(rel: str) -> Path | None:
         """Confine reads to experiments/ — the path comes from the browser."""
@@ -157,78 +155,85 @@ def serve(project: Path, port: int = 8765, run: str | None = None,
             self.end_headers()
             self.wfile.write(body)
 
+        def _emit(self, path: Path, pos: int, rec: dict) -> None:
+            # ids are "<logname>:<pos>" so a resume never seeks into another run's file.
+            self.wfile.write(f"id: {path.name}:{pos}\ndata: {json.dumps(rec)}\n\n".encode())
+
+        def _skeleton(self, path: Path, upto: int | None = None) -> None:
+            """Replay only the run_start / iteration / run_end rows of a log, so an
+            old or huge run still contributes its shape without its megabytes."""
+            meta = (b'"kind": "run_start"', b'"kind": "run_end"',
+                    b'"kind": "iteration"', b'"kind": "reconnect"')
+            with path.open("rb") as fh:
+                while (upto is None or fh.tell() < upto) and (line := fh.readline()):
+                    if not any(m in line for m in meta):
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if _wanted(rec):
+                        self._emit(path, upto or fh.tell(), rec)
+            self.wfile.flush()
+
+        def _stream(self, last_id: str) -> None:
+            """One continuous feed for the project: every run so far, then live."""
+            while not (logs := run_logs()):
+                time.sleep(0.5)
+            name, _, offset = last_id.rpartition(":")
+            resume = next((p for p in logs if p.name == name), None)
+            if resume is not None and offset.isdigit():
+                # Reconnect: the browser already has everything up to this point.
+                path, pos = resume, min(int(offset), resume.stat().st_size)
+            else:
+                # Fresh connect: earlier runs as skeletons, newest run in detail
+                # (tail only when it is huge; the skipped region as a skeleton).
+                for earlier in logs[:-1]:
+                    self._skeleton(earlier)
+                path, pos = logs[-1], 0
+                if path.stat().st_size > REPLAY_BYTES:
+                    with path.open("rb") as fh:
+                        fh.seek(path.stat().st_size - REPLAY_BYTES)
+                        fh.readline()  # skip into line alignment
+                        pos = fh.tell()
+                    self._skeleton(path, upto=pos)
+
+            idle = 0.0
+            while True:
+                for record, at in _tail(path, pos):
+                    pos = at
+                    if record is None:
+                        idle += 0.25
+                        if idle >= 15:
+                            self.wfile.write(b": ping\n\n")  # keep-alive
+                            self.wfile.flush()
+                            idle = 0.0
+                        # Roll onto the next run once `kopt run` starts a new log,
+                        # but only after draining everything from the current one.
+                        newer = [p for p in run_logs() if p.name > path.name]
+                        if newer:
+                            path, pos = newer[0], 0
+                            break
+                        continue
+                    idle = 0.0
+                    if _wanted(record):
+                        self._emit(path, pos, record)
+                        self.wfile.flush()
+
         def do_GET(self):
             url = urlparse(self.path)
             route = url.path
 
             if route == "/api/events":
-                run_q = (parse_qs(url.query).get("run") or [None])[0]
-                if run_q and run_by_name(run_q) is None:
-                    return self._send(b"no such run", "text/plain", 404)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 try:
-                    while (path := run_by_name(run_q) if run_q else current_log()) is None:
-                        time.sleep(0.5)
-
-                    # Resume where the client left off (EventSource sends
-                    # Last-Event-ID on reconnect); ids are "<logname>:<pos>" so
-                    # a resume never seeks into a different run's file.
-                    pos = 0
-                    last = self.headers.get("Last-Event-ID", "")
-                    name, _, offset = last.rpartition(":")
-                    if name == path.name and offset.isdigit():
-                        pos = min(int(offset), path.stat().st_size)
-                    elif path.stat().st_size > REPLAY_BYTES:
-                        # Fresh connect on a huge log: full message detail only
-                        # for the tail, but backfill the meta skeleton
-                        # (run_start / iteration / run_end rows) from the
-                        # skipped region so the whole run's shape still shows.
-                        with path.open("rb") as fh:
-                            fh.seek(path.stat().st_size - REPLAY_BYTES)
-                            fh.readline()  # skip into line alignment
-                            pos = fh.tell()
-                        meta = (b'"kind": "run_start"', b'"kind": "run_end"',
-                                b'"kind": "iteration"', b'"kind": "reconnect"')
-                        with path.open("rb") as fh:
-                            while fh.tell() < pos and (line := fh.readline()):
-                                if not any(m in line for m in meta):
-                                    continue
-                                try:
-                                    rec = json.loads(line)
-                                except json.JSONDecodeError:
-                                    continue
-                                self.wfile.write(
-                                    f"id: {path.name}:{pos}\ndata: {json.dumps(rec)}\n\n".encode())
-                            self.wfile.flush()
-
-                    idle = 0.0
-                    for record, pos in _tail(path, pos):
-                        if record is None:
-                            idle += 0.25
-                            if idle >= 15:
-                                self.wfile.write(b": ping\n\n")  # keep-alive
-                                self.wfile.flush()
-                                idle = 0.0
-                            continue
-                        idle = 0.0
-                        if not _wanted(record):
-                            continue
-                        self.wfile.write(
-                            f"id: {path.name}:{pos}\ndata: {json.dumps(record)}\n\n".encode())
-                        self.wfile.flush()
+                    self._stream(self.headers.get("Last-Event-ID", ""))
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # EventSource reconnects on its own
                 return
-
-            if route == "/api/runs":
-                runs = [
-                    {"name": p.stem, "size": p.stat().st_size}
-                    for p in list_run_logs(project)
-                ]
-                return self._send(json.dumps(runs).encode(), "application/json")
 
             if route == "/api/history":
                 return self._send(json.dumps(load_history(project)).encode(), "application/json")
@@ -265,8 +270,9 @@ def serve(project: Path, port: int = 8765, run: str | None = None,
     server.daemon_threads = True
     print(f"http://{host}:{port}")
     if pinned_log is not None:
-        print(f"  log {pinned_log.name}"
-              + ("" if pinned else f"  (newest of {len(list_run_logs(project))})"))
+        print(f"  pinned to run {pinned_log.name}")
+    elif (n := len(list_run_logs(project))):
+        print(f"  following {n} run(s) — new runs are appended as they start")
     else:
         print("  no run yet — the log fills in when `kopt run` starts")
     try:

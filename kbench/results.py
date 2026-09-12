@@ -75,7 +75,7 @@ class BenchResult:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "BenchResult":
+    def from_dict(cls, d: dict) -> BenchResult:
         s = d["summary"]
         return cls(
             definition=s["definition"],

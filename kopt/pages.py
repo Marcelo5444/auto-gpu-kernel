@@ -124,10 +124,10 @@ NAV = """<nav>
 </nav>"""
 
 
-def _shell(title: str, nav_extra: str, body: str, script: str) -> str:
+def _shell(title: str, nav_extra: str, body: str, script: str, extra_css: str) -> str:
     return (
         "<!doctype html>\n<meta charset=\"utf-8\">"
-        f"<title>kopt · {title}</title>\n<style>{CSS}{MD_CSS}{{extra_css}}</style>\n"
+        f"<title>kopt · {title}</title>\n<style>{CSS}{MD_CSS}{extra_css}</style>\n"
         + NAV.format(extra=nav_extra)
         + f"\n{body}\n<script>\n{COMMON_JS}\n"
         "document.querySelectorAll('nav a').forEach(a=>{"
@@ -155,7 +155,7 @@ details pre{max-height:60vh}
 
 LOG_JS = r"""
 const $=i=>document.getElementById(i), log=$('log');
-let tools=0, logged=0, seen=new Set();
+let tools=0, logged=0, runs=0, seen=new Set();
 const near=()=>innerHeight+scrollY>=document.body.scrollHeight-60;
 function put(el){const b=near();log.appendChild(el);if(b)scrollTo(0,document.body.scrollHeight);}
 function row(cls,text){const d=document.createElement('div');d.className='row '+cls;d.textContent=text;put(d);}
@@ -203,28 +203,21 @@ function toolResult(m){
   const bad=/^(Error|Path .* not found)/i.test(txt.trim());
   block('res'+(bad?' bad':''),(bad?'✗ ':'')+'output · '+nlines(txt)+' lines',txt);
 }
-fetch('/api/runs').then(r=>r.json()).then(rs=>{
-  const sel=$('runsel'), cur=new URLSearchParams(location.search).get('run');
-  rs.slice().reverse().forEach((r,i)=>{
-    const o=document.createElement('option');
-    o.value=r.name;o.textContent=r.name+' · '+(r.size/1e6).toFixed(0)+' MB';
-    if(cur?r.name===cur:i===0)o.selected=true;
-    sel.appendChild(o);});
-  sel.onchange=()=>{location.search='?run='+sel.value;};
-}).catch(()=>{});
-const es=new EventSource('/api/events'+location.search);
+const es=new EventSource('/api/events');
+const spentByRun={}, runOf=e=>String(e.lastEventId||'').split(':')[0];
 es.onopen=()=>$('status').textContent='live';
 es.onerror=()=>$('status').textContent='disconnected — retrying';
 es.onmessage=e=>{
   const r=JSON.parse(e.data);
-  if(r.kind==='run_start'){$('model').textContent=r.model;
-    row('meta','run start — '+r.project+'  max_iterations='+r.max_iterations+(r.budget?'  budget=$'+r.budget:''));return;}
-  if(r.kind==='run_end'){$('status').textContent='finished';row('iter','run end — '+r.reason);return;}
+  if(r.kind==='run_start'){$('model').textContent=r.model;$('status').textContent='live';runs++;$('runs').textContent=runs;
+    row('meta','▶ run '+runs+' ('+runOf(e)+') — '+r.model+'  max_iterations='+r.max_iterations+(r.budget?'  budget=$'+r.budget:''));return;}
+  if(r.kind==='run_end'){$('status').textContent='idle — waiting for next run';row('iter','run end — '+r.reason);return;}
   if(r.kind==='reconnect'){row('meta','session ended — reconnecting');return;}
   if(r.kind==='iteration'){
-    $('iter').textContent=r.idx;$('spent').textContent='$'+Number(r.spent).toFixed(4);
+    $('iter').textContent=r.idx;spentByRun[runOf(e)]=Number(r.spent);
+    $('spent').textContent='$'+Object.values(spentByRun).reduce((a,b)=>a+b,0).toFixed(4);
     if(r.experiment){logged++;$('logged').textContent=logged;}
-    row('iter','■ iteration '+r.idx+' — '+(r.experiment||'NOTHING LOGGED')+'  '+Math.round(r.seconds)+'s  '
+    row('iter','■ iteration '+r.idx+' — '+(r.experiment||(r.benchmarks?'UNLOGGED ('+r.benchmarks+' benchmark runs)':'NOTHING LOGGED'))+'  '+Math.round(r.seconds)+'s  '
       +r.tool_calls+' tools  '+r.tokens+' tok  $'+Number(r.cost).toFixed(4));
     return;}
   if(r.kind!=='event'||r.type!=='message_end')return;
@@ -237,8 +230,8 @@ $('expand').onchange=e=>document.querySelectorAll('#log details').forEach(d=>d.o
 log.classList.add('hide-read');
 """
 
-LOG_NAV = """<select id="runsel" title="run log"></select>
-  <b id="model">—</b>
+LOG_NAV = """<b id="model">—</b>
+  <span>runs</span> <b id="runs">0</b>
   <span>iter</span> <b id="iter">0</b>
   <span>logged</span> <b id="logged">0</b>
   <span>tools</span> <b id="tools">0</b>
@@ -394,16 +387,14 @@ tree().then(()=>{const h=decodeURIComponent(location.hash.slice(1)); if(h)open_(
 
 
 def log_page() -> str:
-    return _shell("log", LOG_NAV, '<main><div id="log"></div></main>', LOG_JS).replace(
-        "{extra_css}", LOG_CSS
-    )
+    return _shell("log", LOG_NAV, '<main><div id="log"></div></main>', LOG_JS, LOG_CSS)
 
 
 def chart_page() -> str:
     nav = ('<label><input type="checkbox" id="showQuick"> show quick probes</label>'
            '<span id="nprobe"></span>')
     body = '<main><div id="chart"></div><table id="tbl"></table></main>'
-    return _shell("chart", nav, body, CHART_JS).replace("{extra_css}", CHART_CSS)
+    return _shell("chart", nav, body, CHART_JS, CHART_CSS)
 
 
 def files_page() -> str:
@@ -411,4 +402,4 @@ def files_page() -> str:
             '<div id="view"><div id="path"></div>'
             '<div id="md" class="md"></div><pre id="body"></pre></div></div></main>')
     nav = '<button id="rawBtn" style="display:none">raw</button>'
-    return _shell("experiments", nav, body, FILES_JS).replace("{extra_css}", FILES_CSS)
+    return _shell("experiments", nav, body, FILES_JS, FILES_CSS)
