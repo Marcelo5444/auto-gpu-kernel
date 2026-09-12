@@ -1,0 +1,46 @@
+# MLX attention on Apple Silicon — the local development example for task mode.
+#
+#   kopt init-task configs/mlx_attention.toml      # -> work/mlx-attention
+#   kopt run work/mlx-attention -n 5 --model anthropic/claude-opus-5 --thinking low
+#
+# `path` is resolved relative to this file and snapshotted into the project as its own
+# git repo, so no remote is needed. Requires `pip install mlx pytest` in the environment
+# kopt runs from.
+
+[task]
+name = "mlx-attention"
+workdir = "repo"
+objective = """
+Make `attention()` in attention.py faster on Apple Silicon (MLX, Metal GPU) while
+keeping its signature, shapes, dtypes, and numerics within the tolerances of
+test_attention.py.
+
+Only attention.py may change. Do not call mx.fast.scaled_dot_product_attention or any
+other prebuilt attention op — the point is to build the fast path (fused Metal kernel
+via mx.fast.metal_kernel, tiling / online softmax, avoiding materialized GQA repeats
+and masks, mx.compile, etc.).
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `geomean_median_ms`
+(lower is better). Quick mode may use `--quick` and fewer iterations but must report the
+same unit. Keep warmup so kernel compilation is excluded; every timed call already ends
+in mx.eval so GPU work is included.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass. Full mode should also
+compare attention() against mx.fast.scaled_dot_product_attention on the exact bench.py
+workload shapes (float16 and float32), since the pytest shapes are small.
+"""
+hints = """
+The baseline materializes repeated K/V heads for GQA, the full [L, S] score matrix, and a
+boolean causal mask. Decode (L=1) is memory-bound on K/V reads; prefill is compute-bound.
+mx.fast.metal_kernel lets you write a Metal shader inline from Python. Check
+mx.metal.device_info() for the chip.
+"""
+
+[task.repo]
+path = "../examples/mlx-attention"
+
+[task.hardware]
+gpus = 1
+gpu = "Apple M-series"
