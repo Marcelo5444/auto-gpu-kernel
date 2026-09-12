@@ -1,6 +1,6 @@
 [project]
 name = "kbench"
-version = "0.1.0"
+version = "1.0.0"
 description = "Kernel benchmarking with pluggable remote GPU backends, and an agent loop over it"
 requires-python = ">=3.11"
 dependencies = []
