@@ -1,0 +1,55 @@
+# cuTile attention on NVIDIA GPU (Blackwell SM120, Hopper SM90, Ampere SM80)
+# 
+#   kopt init-task configs/cutile_attention.toml      # -> work/cutile-attention
+#   kopt run work/cutile-attention -n 20 --model anthropic/claude-opus-5 --thinking low
+#
+# Requires: pip install cuda-tile[tileiras] torch  (in the environment kopt runs from)
+
+[task]
+name = "cutile-attention"
+workdir = "repo"
+objective = """
+Make scaled dot-product attention faster on NVIDIA GPU using cuTile while
+keeping its signature, shapes, dtypes, and numerics within tolerances.
+
+Only attention.py may change. Implement the fused kernel using @ct.kernel and ct.launch.
+Do not call prebuilt attention ops — the point is to build the fast path
+(tiling, async copy, tiled MMA, online softmax, avoiding materialized GQA repeats).
+"""
+measure = """
+Run `python bench.py --json <out>` in the repo; the metric is `geomean_median_ms`
+(lower is better). Quick mode may use `--quick` and fewer iterations but must report the
+same unit. Keep warmup so JIT compilation is excluded; every timed call ends in 
+stream synchronization so GPU work is included.
+"""
+validate = """
+Run `python -m pytest -q` in the repo; every test must pass. Full mode should also
+compare attention() against a reference implementation (e.g., flash-attn or manual 
+PyTorch SDPA) on the exact bench.py workload shapes (fp16, bf16, fp8), since pytest 
+shapes are small.
+"""
+hints = """
+The baseline materializes repeated K/V heads for GQA, the full [L, S] score matrix, 
+and a boolean causal mask. Decode (L=1) is memory-bound on K/V reads; prefill is compute-bound.
+
+cuTile lets you write tiled kernels inline from Python. Key primitives:
+- ct.load/ct.store for global↔register/tile movement
+- ct.cp_async + ct.barrier for async global→shared memory
+- ct.mma with MmaAtom for tensor core GEMM
+- Online softmax: maintain running max/denom per row, no materialized [L,S] matrix
+- GQA: avoid mx.repeat by strided loads or broadcast in shared memory
+
+Check ct.device_capability() for SM version; select MMA atoms accordingly.
+
+Reference implementations to study (in TileGym):
+- tilegym/ops/cutile/attention.py — production FMHA with online softmax, TMA, pipelining
+- tilegym/ops/cutile/flash_decode.py — decode-optimized path
+- tilegym/ops/cutile/mla_decoding.py — MLA-specific decoding
+"""
+
+[task.repo]
+path = "../examples/cutile-attention"
+
+[task.hardware]
+gpus = 1
+gpu = "GB200"

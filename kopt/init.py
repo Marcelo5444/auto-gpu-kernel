@@ -29,6 +29,7 @@ BUILD = {
     "triton": ("triton", "triton"),
     "cuda": ("cuda", "cuda"),
     "cutedsl": ("triton", "cutedsl"),
+    "cutile": ("triton", "cutile"),
 }
 
 
