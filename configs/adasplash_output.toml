@@ -1,0 +1,77 @@
+# AdaSplash get_output kernel optimization task
+# Target: adasplash/forward/cute/fwd_output.py AdaSplashOutputSm90 kernel
+
+[task]
+name = "adasplash-output"
+workdir = "repo"
+objective = """
+Make the AdaSplash get_output kernel (Kernel C: no-union 64-row tiles, 2 CTAs/SM) faster using cuTile while keeping its signature, shapes, dtypes, and numerics within tolerances.
+
+Only fwd_output.py may change. The kernel uses adaptive one-pass mask decode through a ring + K/V gather + dense wgmma.
+Do not call prebuilt attention ops — the point is to optimize the existing cuTile kernel (producer/consumer pipeline, ring decode, band sidecar, wgmma QK/PV).
+
+Key optimization opportunities:
+- Producer: ring decode (128 words = 4096 cols per round), band decode, gather tile
+- Consumer: phase1 (entmax scoring), pv_pair (wgmma PV), epilogue
+- Overlap vs serial scheduling modes
+- Register pressure (mma_regs vs producer_regs)
+- tile_g (32/64/128), num_stages (2/3/4), ring capacity
+- LPT scheduler vs varlen scheduler
+"""
+measure = """
+Run `python harness/benchmark.py --json <out>` in the repo; the metric is `geomean_median_ms` (lower is better). Quick mode may use `--quick` and fewer iterations but must report the same unit. Keep warmup so JIT compilation is excluded; every timed call ends in stream synchronization so GPU work is included.
+"""
+validate = """
+Run `python harness/test_output.py` in the repo; every test must pass. Full mode should also compare get_output() against the fp64 mirror reference on the exact bench.py workload shapes (bfloat16, float16), since pytest shapes are small.
+"""
+hints = """
+The baseline is the adasplash/forward/cute/fwd_output.py (Kernel C) implementation from the merge-cutile branch. Key features:
+
+Architecture:
+- 64-row query tiles (tile_m=64), ONE consumer warpgroup per CTA
+- 256-thread CTA (128 producer + 128 consumer), min_blocks_per_mp = 2 (2 CTAs/SM)
+- tile_g = 64 (K/V gather chunk), num_stages = 2 (K/V pipeline depth)
+- Ring buffer for mask decode: default 8192 entries (16 KB u16)
+- Band sidecar: 2 mask words per 64-row tile (64 columns max)
+
+Producer (warps 0-3):
+- decode_round: 128 words = 4096 columns per round, popc + warp prefix + cross-warp scan
+- decode_band: bit-parallel band decode by warp 0 (2 words per tile)
+- emit_chunk: gather K then V via cp.async, index wrapped through ring
+
+Consumer (warps 4-7):
+- phase1: entmax scoring with band sidecar mask, tau-hat threshold, supp sidecar
+- pv_pair: dense wgmma (P2 @ V, and P @ V for backward)
+- epilogue: half2 scale, smem store, universal copy to gmem
+
+Optimization knobs:
+- tile_g: 32/64/128 (affects smem, occupancy, GEMM shape)
+- num_stages: 2/3/4 (K/V pipeline depth)
+- ring_log2: 13 default (8192), can increase for dense tiles
+- overlap: True/False (pipelined vs serial consumer)
+- mma_regs + producer_regs <= 256 (register allocation)
+- wide_index: Uint16 vs Uint32 for ring indices (N > 65536)
+
+Reference implementations in TileGym:
+- tilegym/ops/cutile/attention.py — production FMHA with online softmax, TMA, pipelining
+- tilegym/ops/cutile/flash_decode.py — decode-optimized path
+
+Accuracy contract (from bench/fwd_output.py):
+- Determinism, overlap==serial bitwise, fwd-only out bitwise
+- vs fp64 mirror: 2 ulp + extra_abs budget, fraction < 5e-4
+- supp sidecar: strict fp32 accumulation-order slop only (zero violations expected)
+- vs Triton: error <= 2 * triton_error + 1e-3
+"""
+
+[task.repo]
+path = "../examples/adasplash-output"
+
+[task.hardware]
+gpus = 1
+gpu = "GB200"
+
+[kopt]
+max_iterations = 10
+budget_ms = 3600000
+model = "nvidia/zai-org/glm-5.3-flash"
+thinking = "low"
