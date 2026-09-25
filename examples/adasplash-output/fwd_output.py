@@ -8,6 +8,7 @@ Target: Kernel C - no-union 64-row tiles, 2 CTAs/SM, adaptive mask decode + gath
 """
 
 from typing import Optional, Callable
+from functools import partial
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -19,7 +20,9 @@ from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from quack import copy_utils
 from quack import layout_utils
+from quack import sm90_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute import pipeline as pipeline_custom
 from flash_attn.cute.named_barrier import NamedBarrierFwd
@@ -99,20 +102,20 @@ class AdaSplashOutputSm90:
         mQ, mK, mV, mOut, mOut2 = [
             assume_tensor_aligned(t) for t in (mQ, mK, mV, mOut, mOut2)
         ]
-        mQ = layout_utils.select(mQ, [1, 3, 2, 0])
-        mOut = layout_utils.select(mOut, [1, 3, 2, 0])
-        mOut2 = layout_utils.select(mOut2, [1, 3, 2, 0])
-        mK = layout_utils.select(mK, [1, 3, 2, 0])
-        mV = layout_utils.select(mV, [1, 3, 2, 0])
-        mTau = layout_utils.select(mTau, [2, 1, 0])
-        mMask = layout_utils.select(mMask, [3, 2, 1, 0])
+        mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, [1, 3, 2, 0]))
+        mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, [1, 3, 2, 0]))
+        mOut2 = cute.make_tensor(mOut2.iterator, cute.select(mOut2.layout, [1, 3, 2, 0]))
+        mK = cute.make_tensor(mK.iterator, cute.select(mK.layout, [1, 3, 2, 0]))
+        mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, [1, 3, 2, 0]))
+        mTau = cute.make_tensor(mTau.iterator, cute.select(mTau.layout, [2, 1, 0]))
+        mMask = cute.make_tensor(mMask.iterator, cute.select(mMask.layout, [3, 2, 1, 0]))
         if const_expr(mSupp is not None):
             mSupp = layout_utils.select(mSupp, [2, 1, 0])
 
-        self.sQ_layout = sm90_utils_basic.make_smem_layout(
+        self.sQ_layout = sm90_utils.make_smem_layout(
             self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.head_dim), None
         )
-        self.sK_layout = sm90_utils_basic.make_smem_layout(
+        self.sK_layout = sm90_utils.make_smem_layout(
             self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_g, self.head_dim), self.num_stages
         )
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
@@ -410,7 +413,7 @@ class AdaSplashOutputSm90:
             if warp_idx_in_wg == 0:
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 gQ = cute.local_tile(mQ_cur, (self.tile_m, self.head_dim), (m_block, 0))
-                load_Q, _, _ = layout_utils.tma_get_copy_fn(
+                load_Q, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True)
                 pipeline_q.producer_acquire_w_index_phase(0, q_phase)
                 load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))

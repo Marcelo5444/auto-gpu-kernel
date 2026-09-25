@@ -1,0 +1,42 @@
+[task]
+name = "adasplash_cutile_get_output"
+language = "cutile"
+objective = "minimize_elapsed_cycles"
+arch = "sm_121"
+workdir = "repo"
+
+measure = """
+Run `python bench.py --repo {repo_path} --mode quick --json` in the repo; the metric is `geomean_median_ms` (lower is better).
+"""
+
+validate = """
+Run `python test_cutile_output.py --repo {repo_path} --json` in the repo; every test must pass.
+"""
+
+hints = """
+The baseline is the AdaSplash get_output kernel (Kernel C) in cutile_get_output.py.
+This is the cuTile implementation of the no-union 64-row tiles, 2 CTAs/SM kernel.
+Key optimization opportunities:
+- TMA loads for Q/K/V (latency hints LATENCY_K=2, LATENCY_V=4)
+- TMA stores for OUT/OUT2
+- Affine fast path when all blocks active (skips ACTIVE_IDX loads)
+- Sparse path with compacted indices
+- MMA latency hiding with async copy
+- Online softmax with entmax-1.5
+- GQA support with GROUP_SIZE
+"""
+
+[task.repo]
+path = "../examples/adasplash-output"
+
+[task.hardware]
+gpus = 1
+gpu = "GB10"
+
+[builder]
+type = "triton"
+
+[optimizer]
+model = "nvidia/zai-org/glm-5.3-flash"
+iterations = 10
+thinking = "low"
