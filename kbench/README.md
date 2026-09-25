@@ -63,11 +63,13 @@ The same `validate.py` / `benchmark.py` contract runs unchanged; only the transp
 The two runners are mutually exclusive: a `[task.slurm]` table selects one mode.
 
 The batch runner keeps the framework off the cluster.  `kbench` and `kopt` are never
-copied to the scratch root -- the container does not import them.  The only things shipped
+copied to the cluster -- the container does not import them.  The only things shipped
 per run are the generated `harness/` scripts and the candidate (code-under-test) tree, into
-a directory named by a freshly generated run id under the scratch root.  Because the path is
-new every run, parallel runs never touch each other's code and a run never edits a
-long-lived shared tree (it cannot step on a concurrent job).  Status is read from the
+a directory named by a freshly generated run id under a dedicated `bundle_root` (your home,
+an NFS mount the compute nodes can see) -- never the shared project scratch, which already
+holds the long-lived project trees other jobs read.  Because the path is
+new every run and removed when the run finishes, parallel runs never touch each other's code
+and a run never edits or steps on a long-lived shared tree.  Status is read from the
 interactive scheduler (`squeue -i`) and job accounting (`sacct`); no GPU command is ever run
 on the login node, which is used only for submission and status.  A deterministic seed is the
 first torch call, the forward-compat `NVIDIA_DISABLE_REQUIRE=1` is exported by default, and
@@ -75,6 +77,6 @@ the candidate is mounted as the only container path with `--container-no-mount-h
 host `~/.local` cannot shadow container packages.
 
 Provenance is recorded as `slurm-batch / <gpu> xN`, so batch numbers never compare against
-local or overlap-mode measurements.  Each run leaves its bundle (script, `*.log`, the result
-JSON) under the scratch root, inspectable with plain `cat`; clean it up explicitly, never
-from inside the job.  See `kbench/slurm_batch.py`.
+local or overlap-mode measurements.  Each run's bundle (script, `*.log`, the result
+JSON) is removed by default after the result is read back; set `keep_bundle = true` to keep
+it under `bundle_root` for inspection.  See `kbench/slurm_batch.py`.

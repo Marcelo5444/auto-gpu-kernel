@@ -61,8 +61,12 @@ CUDA_TILE_CACHE_DIR = "/tmp/cutile_kopt"
 [task.slurm]
 mode = "batch"
 ssh_host = "marcelos@dlcluster"          # login node: submit + status only, never GPU work
-scratch_root = "/home/scratch.marcelos_wwfo"   # NFS scratch visible to the compute nodes
-image = "/home/scratch.marcelos_wwfo/cuda133-pytorch-amd64.sqsh"
+# The per-run bundle (generated harness + candidate tree) is written under home, NOT the
+# shared scratch root that already holds the long-lived project trees other jobs read.
+# Home is NFS-mounted and visible to every compute node, so the container can mount it; the
+# bundle is unique per run and removed when the run finishes, so the home quota is safe.
+bundle_root = "/home/marcelos/kbench-bundles"
+image = "/home/scratch.marcelos_wwfo/cuda133-pytorch-amd64.sqsh"   # read-only shared image
 partition = "dgxh100"                     # override: KBENCH_SLURM_PARTITION
 account = ""                              # scheduler auto-assigns on dlcluster
 gpus = 1
@@ -73,4 +77,5 @@ mount_target = "/work"
 python = "python3"
 non_ngc = true                            # custom .sqsh: enroot needs the visibility exports
 export = ["ALL", "NVIDIA_DISABLE_REQUIRE=1"]
+keep_bundle = false                       # remove the bundle after each run (set true to inspect)
 poll_interval = 10

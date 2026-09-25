@@ -9,9 +9,11 @@ side of that boundary:
   the cluster.  The container does not import it -- the generated task harness runs
   standalone contract scripts against a code-under-test checkout passed as ``--repo``.
 * the only thing shipped is the minimal runnable payload: the generated ``harness/``
-  scripts and the candidate ``repo/`` subtree, into a uniquely named directory under the
-  scratch root.  That path is fresh every run, so parallel runs never touch each
-  other's code and a run never edits a long-lived shared tree.
+  scripts and the candidate ``repo/`` subtree, into a uniquely named directory under a
+  dedicated bundle root (your home, an NFS mount the compute nodes can see) -- NOT the
+  shared project scratch, which already holds the long-lived project trees other jobs
+  read.  That path is fresh every run and removed when the run finishes, so parallel runs
+  never touch each other's code and nothing lingers on a shared tree.
 * every scheduler interaction (submit, status, cancel) runs over ``ssh`` to the login
   node from the driving machine, and uses only the interactive scheduler view (squeue
   -i) plus job accounting (sacct).  No GPU step is launched on the login node itself.
@@ -48,13 +50,16 @@ class BatchSpec:
     """How to reach the cluster and request one containerised GPU step.
 
     ``image`` is a pyxis ``.sqsh``/``.squashfs`` path on the shared filesystem or an
-    ``nvcr.io#...`` reference that enroot imports on the fly.  ``scratch_root`` must be
-    visible to the compute nodes (an NFS/Lustre scratch mount); the run bundle is copied
-    underneath it so the container can mount it.
+    ``nvcr.io#...`` reference that enroot imports on the fly.  ``bundle_root`` is where a
+    run's self-contained bundle is written; it must be visible to the compute nodes (a
+    home/NFS path the container mounts), it is NOT the shared project scratch root -- the
+    per-run bundle never lives alongside the long-lived project trees other jobs read, and
+    it is removed when the run finishes.  Only the container's own compile caches (Triton,
+    cuTile, inductor) belong in node-local /tmp.
     """
 
     ssh_host: str
-    scratch_root: str
+    bundle_root: str
     image: str
     partition: str
     account: str = ""
@@ -71,6 +76,7 @@ class BatchSpec:
     non_ngc: bool = False
     container_extra: tuple = ()
     extra_sbatch: tuple = ()
+    keep_bundle: bool = False
     runid_prefix: str = "kopt"
     poll_interval: int = 10
 
@@ -111,14 +117,18 @@ def spec(raw, gpus):
     if not wants:
         return None
     ssh_host = os.environ.get("KBENCH_SLURM_SSH") or str(raw.get("ssh_host", ""))
-    scratch_root = os.environ.get("KBENCH_SLURM_SCRATCH") or str(raw.get("scratch_root", ""))
+    bundle_root = (
+        os.environ.get("KBENCH_SLURM_BUNDLE_ROOT")
+        or os.environ.get("KBENCH_SLURM_SCRATCH")  # back-compat alias
+        or str(raw.get("bundle_root", raw.get("scratch_root", "")))
+    )
     image = os.environ.get("KBENCH_SLURM_IMAGE") or str(raw.get("image", ""))
     partition = os.environ.get("KBENCH_SLURM_PARTITION") or str(raw.get("partition", ""))
     missing = [
         name
         for name, value in (
             ("ssh_host", ssh_host),
-            ("scratch_root", scratch_root),
+            ("bundle_root", bundle_root),
             ("image", image),
             ("partition", partition),
         )
@@ -129,7 +139,7 @@ def spec(raw, gpus):
     export = tuple(raw.get("export", ("ALL", "NVIDIA_DISABLE_REQUIRE=1")))
     return BatchSpec(
         ssh_host=ssh_host,
-        scratch_root=str(scratch_root).rstrip("/"),
+        bundle_root=str(bundle_root).rstrip("/"),
         image=image,
         partition=partition,
         account=str(raw.get("account", "")),
@@ -143,6 +153,7 @@ def spec(raw, gpus):
         non_ngc=_truthy(raw.get("non_ngc", False)),
         container_extra=tuple(str(a) for a in raw.get("container_extra", ())),
         extra_sbatch=tuple(str(a) for a in raw.get("extra_sbatch", ())),
+        keep_bundle=_truthy(raw.get("keep_bundle", False)),
         runid_prefix=str(raw.get("runid_prefix", "kopt")),
         poll_interval=int(raw.get("poll_interval", 10)),
     )
@@ -164,9 +175,9 @@ def _remote(spec_, script, timeout=None):
 
 
 def bundle_paths(spec_, rid):
-    """(host path under scratch, container path) for one run's bundle."""
+    """(host path under bundle_root, container path) for one run's bundle."""
     leaf = "%s-%s" % (spec_.runid_prefix, rid)
-    host = pj(spec_.scratch_root, leaf)
+    host = pj(spec_.bundle_root, leaf)
     return host, spec_.mount_target
 
 
@@ -285,11 +296,11 @@ class Session:
         """
         s = self.spec
         out_leaf = pj(self.host_bundle, "out", phase, mode)
-        # The candidate is mounted under the bundle as repo/; the contract scripts import
-        # the code-under-test at module load (before their own sys.path tweaks), so make the
-        # candidate importable and run with it as the working directory.
-        repo_container = repo_container_rel
-        extra_export = ("PYTHONPATH=%s" % repo_container, "PYTHONDONTWRITEBYTECODE=1")
+        # The candidate tree is mounted as <mount>/repo and the container runs with it as
+        # the working directory, so Python's cwd entry ('' on the import path) makes the
+        # code-under-test importable -- the same thing the local backend gets from running
+        # the contract scripts with cwd=work.  No env-var path hacking, and the long-lived
+        # project trees on shared scratch are never touched.
         lines = [
             "#!/bin/bash",
             "#SBATCH --job-name=%s-%s-%s-%s" % (s.runid_prefix, phase, mode, Path(script_name).stem),
@@ -301,7 +312,7 @@ class Session:
             "#SBATCH --time=%s" % s.time_limit,
             "#SBATCH --output=%s" % pj(out_leaf, "%s.log" % Path(script_name).stem),
             "#SBATCH --error=%s" % pj(out_leaf, "%s.err" % Path(script_name).stem),
-            "#SBATCH --export=%s" % ",".join((*s.export, *s.non_ngc_export(), *extra_export)),
+            "#SBATCH --export=%s" % ",".join((*s.export, *s.non_ngc_export())),
         ]
         if s.account:
             lines.append("#SBATCH --account=%s" % s.account)
@@ -310,10 +321,11 @@ class Session:
         lines += list(s.extra_sbatch)
         # pyxis container directives: mount only the run bundle (never the framework,
         # never node /tmp); home is not mounted so host ~/.local cannot shadow container pkgs.
+        # The working directory is the candidate so its modules import from cwd, as on local.
         lines += [
             "#SBATCH --container-image=%s" % s.image,
             "#SBATCH --container-mounts=%s" % s.container_mounts(self.host_bundle),
-            "#SBATCH --container-workdir=%s" % s.mount_target,
+            "#SBATCH --container-workdir=%s" % repo_container_rel,
             "#SBATCH --container-no-mount-home",
         ]
         lines += list(s.container_extra)
@@ -421,10 +433,18 @@ class Session:
         return (exit_code, time.monotonic() - started)
 
     def close(self):
-        # Leave the bundle in place so the job output and artifact stay inspectable; it
-        # is named by a unique run id, cannot collide, and lives under scratch (not the
-        # shared project tree).  Clean it explicitly, never from inside the job.
-        pass
+        # Remove the per-run bundle by default so the home quota is protected and stale
+        # run code never lingers.  The scored artifact was already read back into the
+        # local out.json before close, and the job's own log lives in the Slurm record; the
+        # bundle is only kept on request (keep_bundle=true) for inspection.  The clean-up
+        # runs over ssh after the job, never from inside it.
+        if self.spec.keep_bundle:
+            self.log("kept run bundle %s" % self.host_bundle)
+            return
+        if self._bundle_open:
+            _remote(self.spec, "rm -rf %s" % shlex.quote(self.host_bundle))
+            self.log("removed run bundle %s" % self.host_bundle)
+            self._bundle_open = False
 
 
 def _parse_exit(state):

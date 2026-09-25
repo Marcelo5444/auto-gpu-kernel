@@ -2,7 +2,7 @@
 
 Nothing here reaches the cluster: the ssh transport and the tar|ssh pipe are replaced
 with local stand-ins so the real submit/ship/poll/retrieve logic runs against a local
-directory standing in for the shared scratch root.
+directory standing in for the run bundle root.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from kbench.slurm_batch import BatchSpec, Session
 def make_spec(**overrides):
     base = dict(
         ssh_host="marcelos@dlcluster",
-        scratch_root="/home/scratch.marcelos_wwfo",
+        bundle_root="/home/marcelos/kbench-bundles",
         image="cuda133-pytorch-amd64.sqsh",
         partition="dgxh100",
         gpus=1,
@@ -39,28 +39,28 @@ class GateTest(unittest.TestCase):
     def test_no_batch_marker_disables_even_inside_an_allocation(self):
         # kbench launched from within a compute shell must not reroute its own work.
         with patch.dict("os.environ", {"SLURM_JOB_ID": "777"}, clear=True):
-            spec_in = {"ssh_host": "h", "scratch_root": "/s", "image": "i", "partition": "p"}
+            spec_in = {"ssh_host": "h", "bundle_root": "/s", "image": "i", "partition": "p"}
             self.assertIsNone(slurm_batch.spec(spec_in, 1))
 
     def test_mode_batch_enables(self):
-        raw = {"mode": "batch", "ssh_host": "h", "scratch_root": "/s", "image": "i", "partition": "p"}
+        raw = {"mode": "batch", "ssh_host": "h", "bundle_root": "/s", "image": "i", "partition": "p"}
         with patch.dict("os.environ", {}, clear=True):
             self.assertIsNotNone(slurm_batch.spec(raw, 1))
 
     def test_batch_true_enables(self):
-        raw = {"batch": True, "ssh_host": "h", "scratch_root": "/s", "image": "i", "partition": "p"}
+        raw = {"batch": True, "ssh_host": "h", "bundle_root": "/s", "image": "i", "partition": "p"}
         with patch.dict("os.environ", {}, clear=True):
             self.assertIsNotNone(slurm_batch.spec(raw, 1))
 
     def test_missing_field_names_itself(self):
-        raw = {"mode": "batch", "ssh_host": "h", "scratch_root": "/s", "image": "i"}
+        raw = {"mode": "batch", "ssh_host": "h", "bundle_root": "/s", "image": "i"}
         with patch.dict("os.environ", {}, clear=True):
             with self.assertRaises(SystemExit) as caught:
                 slurm_batch.spec(raw, 1)
         self.assertIn("partition", str(caught.exception))
 
     def test_env_overrides_file(self):
-        raw = {"mode": "batch", "ssh_host": "h", "scratch_root": "/s", "image": "i", "partition": "p"}
+        raw = {"mode": "batch", "ssh_host": "h", "bundle_root": "/s", "image": "i", "partition": "p"}
         with patch.dict("os.environ", {"KBENCH_SLURM_PARTITION": "preprod"}, clear=True):
             self.assertEqual(slurm_batch.spec(raw, 1).partition, "preprod")
 
@@ -71,9 +71,52 @@ class BundleUniquenessTest(unittest.TestCase):
         one = Session(spec_, os.getcwd(), rid="RUN-A")
         two = Session(spec_, os.getcwd(), rid="RUN-B")
         self.assertNotEqual(one.host_bundle, two.host_bundle)
-        self.assertTrue(one.host_bundle.startswith("/home/scratch.marcelos_wwfo/kopt-RUN-A"))
+        self.assertTrue(one.host_bundle.startswith("/home/marcelos/kbench-bundles/kopt-RUN-A"))
         self.assertTrue(one.host_bundle.endswith(one.rid))
         self.assertNotIn("auto-gpu-kernel", one.host_bundle)
+
+    def test_bundle_never_lives_in_shared_scratch(self):
+        # The long-lived project trees other jobs read live on /home/scratch...; a run
+        # bundle there would risk stepping on them. The default home-based root avoids it.
+        spec_ = make_spec()
+        self.assertNotIn("/scratch", spec_.bundle_root)
+        self.assertTrue(spec_.bundle_root.startswith("/home/"))
+
+    def test_close_removes_bundle_by_default(self):
+        spec_ = make_spec()
+        sess = Session(spec_, os.getcwd(), rid="CL-1")
+        sess._bundle_open = True
+        removed = {}
+
+        def fake_remote(sp, script, timeout=None):
+            removed["cmd"] = script
+            class R:
+                stdout, returncode, stderr = "", 0, ""
+            return R()
+
+        with patch("kbench.slurm_batch._remote", side_effect=fake_remote):
+            sess.close()
+        self.assertTrue(sess.host_bundle in removed.get("cmd", ""))
+        self.assertIn("rm -rf", removed.get("cmd", ""))
+        self.assertFalse(sess._bundle_open)
+
+    def test_close_keeps_bundle_when_requested(self):
+        spec_ = make_spec(keep_bundle=True)
+        sess = Session(spec_, os.getcwd(), rid="KEEP-1")
+        sess._bundle_open = True
+        with patch("kbench.slurm_batch._remote") as fake:
+            sess.close()
+        fake.assert_not_called()
+        self.assertTrue(sess._bundle_open)
+
+    def test_container_workdir_is_the_candidate(self):
+        # Importability comes from running with the candidate as cwd, like local does.
+        sess = Session(make_spec(), os.getcwd(), rid="WD-1")
+        script = sess.submit_script(
+            "benchmark.py", "quick", "b",
+            "/work/harness/benchmark.py", "/work/repo", "/work/out/b/quick/benchmark.json",
+        )
+        self.assertIn("#SBATCH --container-workdir=/work/repo", script)
 
     def test_container_mount_is_the_bundle(self):
         spec_ = make_spec(mount_target="/work")
@@ -193,7 +236,7 @@ class RunScriptOfflineTest(unittest.TestCase):
         return sess, artifact
 
     def test_batch_run_ships_submits_waits_and_reads_back(self):
-        spec_ = make_spec(scratch_root=str(self.scratch))
+        spec_ = make_spec(bundle_root=str(self.scratch))
         sess, artifact = self.run_with_fake(spec_, "b")
         out_local = Path(self.tmp.name) / "out.json"
 
@@ -221,7 +264,7 @@ class RunScriptOfflineTest(unittest.TestCase):
 
     def test_no_cluster_path_leaks_the_framework_checkout(self):
         # The candidate is shipped as repo/, never as an import of kbench itself.
-        spec_ = make_spec(scratch_root=str(self.scratch))
+        spec_ = make_spec(bundle_root=str(self.scratch))
         sess, _ = self.run_with_fake(spec_, "a")
         submit = sess.submit_script(
             "validate.py", "quick", "a",
