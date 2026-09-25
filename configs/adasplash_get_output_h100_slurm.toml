@@ -1,0 +1,76 @@
+# AdaSplash cuTile get_output, optimized on dlcluster H100 via Slurm batch jobs.
+#
+# The agent (kopt loop) thinks and edits on the driving machine; the GPU work runs in an
+# sbatch job whose batch step enters a pyxis container on a compute node.  The framework
+# checkout never reaches the cluster -- only the generated harness and the candidate
+# (code-under-test) tree are shipped, into a fresh bundle under the scratch root each run.
+#
+#   kopt init-task configs/adasplash_get_output_h100_slurm.toml work/adagpu_h100
+#   # hold a node, or submit per iteration (batch mode allocates on its own):
+#   kopt run work/adagpu_h100 -n 20 --model <your-model> --thinking low
+#
+# Override the live allocation knobs from the environment without editing this file:
+#   KBENCH_SLURM_PARTITION=H100_80G_HBM3_SXM_AMD_preprod  # when dgxh100 is jammed
+#   KBENCH_SLURM_IMAGE=/home/scratch.marcelos_wwfo/cuda133-pytorch-amd64.sqsh
+
+[task]
+name = "adasplash_get_output_h100_slurm"
+language = "cutile"
+objective = "minimize_elapsed_cycles"
+arch = "sm_90"   # H100
+workdir = "repo"
+
+measure = """
+Run `python harness/benchmark.py --repo <candidate> --mode quick --output <out.json>` on the
+H100 compute node inside the container; the metric is `geomean_median_ms` over the swept
+shapes (lower is better). The agent does not run this locally -- it is submitted to Slurm.
+"""
+
+validate = """
+Run `python harness/validate.py --repo <candidate> --mode quick --output <out.json>` on the
+H100 compute node; every case in the sweep must pass against the fp64 mirror reference.
+"""
+
+hints = """
+The baseline is the AdaSplash get_output kernel (Kernel C) in cutile_get_output.py.
+This is the cuTile implementation of the no-union 64-row tiles, 2 CTAs/SM kernel.
+Key optimization opportunities:
+- TMA loads for Q/K/V (latency hints LATENCY_K=2, LATENCY_V=4)
+- TMA stores for OUT/OUT2
+- Affine fast path when all blocks are active (skips ACTIVE_IDX loads)
+- Sparse path with compacted indices
+- MMA latency hiding with async copy
+- Online softmax with entmax-1.5
+- GQA support with GROUP_SIZE
+On H100 (sm_90) the cuTile 1.4.0 runtime in cuda133-pytorch-amd64.sqsh compiles and runs;
+keep BF16 (A100/H100 have no FP16 training tensor cores), never FP16.
+"""
+
+[task.repo]
+path = "../examples/adasplash-output"
+
+[task.hardware]
+gpus = 1
+gpu = "H100 80GB"
+
+[task.env]
+# Node-local compile caches inside the container; never the shared scratch root.
+TRITON_CACHE_DIR = "/tmp/triton_kopt"
+CUDA_TILE_CACHE_DIR = "/tmp/cutile_kopt"
+
+[task.slurm]
+mode = "batch"
+ssh_host = "marcelos@dlcluster"          # login node: submit + status only, never GPU work
+scratch_root = "/home/scratch.marcelos_wwfo"   # NFS scratch visible to the compute nodes
+image = "/home/scratch.marcelos_wwfo/cuda133-pytorch-amd64.sqsh"
+partition = "dgxh100"                     # override: KBENCH_SLURM_PARTITION
+account = ""                              # scheduler auto-assigns on dlcluster
+gpus = 1
+cpus = 16
+time_limit = "02:00:00"                   # dgxh100 caps at 8:00:00; stay well under it
+exclusive = true
+mount_target = "/work"
+python = "python3"
+non_ngc = true                            # custom .sqsh: enroot needs the visibility exports
+export = ["ALL", "NVIDIA_DISABLE_REQUIRE=1"]
+poll_interval = 10

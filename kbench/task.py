@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kbench import slurm
+from kbench import slurm, slurm_batch
 from kbench.config import TaskConfig
 
 VALIDATE_SCRIPT = "validate.py"
@@ -183,6 +183,10 @@ def _env(cfg: TaskConfig, extra: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
+def _batch_enabled(cfg: TaskConfig) -> bool:
+    return slurm_batch.spec(cfg.slurm, cfg.gpus) is not None
+
+
 def _script_cmd(
     cfg: TaskConfig,
     script: Path,
@@ -193,7 +197,8 @@ def _script_cmd(
     """The local interpreter, or the same argv re-entered into an srun container.
 
     Paths go through the mount map rather than being reused as-is: the driving machine's
-    view of the project is not the container's.
+    view of the project is not the container's.  Only the ``srun`` (overlap) runner uses
+    this; the batch runner submits through :class:`kbench.slurm_batch.Session` instead.
     """
     runner = slurm.spec(cfg.slurm, cfg.gpus)
     path = str if runner is None else runner.container_path
@@ -211,6 +216,8 @@ def _script_cmd(
 
 
 def runner_name(cfg: TaskConfig) -> str:
+    if _batch_enabled(cfg):
+        return "slurm-batch"
     return "slurm" if slurm.spec(cfg.slurm, cfg.gpus) is not None else "local"
 
 
@@ -229,7 +236,27 @@ def _run_script(
     *,
     append: bool,
     extra_env: dict[str, str] | None,
+    session=None,
 ) -> tuple[int, float]:
+    if session is not None:
+        # Batch path: ship inputs, submit an sbatch GPU job, poll to completion, read the
+        # artifact back.  The container's own stdout/stderr are captured under the bundle
+        # by the batch script's --output/--error; the driver transcript goes to the run log
+        # and the terminal (the agent thinks on this machine, so live job state is wanted).
+        exit_code, _ = session.run_script(
+            script_path=script,
+            work=work,
+            harness_dir=harness_dir(cfg),
+            mode=mode,
+            phase=session.phase,
+            out_local=output,
+            timeout_s=TIMEOUT_S[mode],
+        )
+        with log_path.open("a" if append else "w") as log:
+            log.write(f"[kbench] {script.stem}: batch exit={exit_code} bundle={session.host_bundle}\n")
+            log.flush()
+        return exit_code, time.monotonic() - session.started
+
     cmd = _script_cmd(cfg, script, work, mode, output)
     print(f"[kbench] {script.stem}: {shlex.join(cmd)}")
     started = time.monotonic()
@@ -353,6 +380,15 @@ def run_mode(
     hrev = harness_rev(cfg)
     print(f"[kbench] mode={mode} cwd={work} candidate={rev} harness={hrev}")
 
+    session = None
+    if _batch_enabled(cfg):
+        # One Session per mode run: validate and benchmark ship into the same unique
+        # bundle, and the candidate is shipped once (fingerprinted) then reused.  The lane
+        # name keeps paired A/B runs from colliding on the shared scratch root.
+        spec_ = slurm_batch.spec(cfg.slurm, cfg.gpus)
+        session = slurm_batch.Session(spec_, cfg.root)
+        session.phase = label or "main"
+
     validation_path = out / "validation.json"
     started = time.monotonic()
     validate_exit, _ = _run_script(
@@ -364,6 +400,7 @@ def run_mode(
         log_path,
         append=False,
         extra_env=extra_env,
+        session=session,
     )
     validation, validation_error = _read_object(validation_path, "validation")
     if validate_exit == TIMEOUT_EXIT:
@@ -405,8 +442,11 @@ def run_mode(
         log_path,
         append=True,
         extra_env=extra_env,
+        session=session,
     )
     result.seconds_wall = time.monotonic() - started
+    if session is not None:
+        session.close()
     result.exit_code = benchmark_exit
     if integrity_error := _integrity_error(cfg, work, rev, hrev):
         result.exit_code = 1
@@ -430,7 +470,7 @@ def run_mode(
 
 def print_result(cfg: TaskConfig, result: TaskResult) -> None:
     print(
-        f"\n{cfg.name}  [{result.mode}]  local / {cfg.gpu} x{cfg.gpus}"
+        f"\n{cfg.name}  [{result.mode}]  {runner_name(cfg)} / {cfg.gpu} x{cfg.gpus}"
         f"  candidate={result.workdir_rev}  harness={result.harness_rev}"
     )
     status = "PASS" if result.passed else "FAIL"
@@ -493,7 +533,7 @@ def run_ab(
 def print_ab(cfg: TaskConfig, a: TaskResult, b: TaskResult, a_label: str) -> None:
     print(
         f"\nA = {a_label}\nB = current tree"
-        f"   [local / {cfg.gpu} x{cfg.gpus}, harness {b.harness_rev}]\n"
+        f"   [{runner_name(cfg)} / {cfg.gpu} x{cfg.gpus}, harness {b.harness_rev}]\n"
     )
     for name, result in (("A", a), ("B", b)):
         value = (

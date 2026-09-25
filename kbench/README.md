@@ -47,3 +47,34 @@ the driving machine, naming the path, instead of as a `FileNotFoundError` inside
 
 Measurements record `slurm / <gpu> xN` as their provenance, so they are never compared
 against numbers taken locally. See [configs/slurm.toml](../configs/slurm.toml).
+
+## The SLURM batch runner (think on the agent, run on the cluster)
+
+`kbench.slurm_batch` is the batch counterpart to the `srun --overlap` runner above. It is
+meant for the case where the optimizing agent runs on a machine without a GPU (a laptop, a
+login node) and the cluster is remote: the agent edits the candidate and reasons about the
+result locally, while every GPU step is an `sbatch` job whose batch step enters a
+pyxis/enroot container on a compute node, and the agent just submits, waits, and reads the
+artifact back over `ssh`.
+
+Enable it for a generated task by adding a `[task.slurm] mode = "batch" ...` table (see
+[configs/adasplash_get_output_h100_slurm.toml](../configs/adasplash_get_output_h100_slurm.toml)).
+The same `validate.py` / `benchmark.py` contract runs unchanged; only the transport differs.
+The two runners are mutually exclusive: a `[task.slurm]` table selects one mode.
+
+The batch runner keeps the framework off the cluster.  `kbench` and `kopt` are never
+copied to the scratch root -- the container does not import them.  The only things shipped
+per run are the generated `harness/` scripts and the candidate (code-under-test) tree, into
+a directory named by a freshly generated run id under the scratch root.  Because the path is
+new every run, parallel runs never touch each other's code and a run never edits a
+long-lived shared tree (it cannot step on a concurrent job).  Status is read from the
+interactive scheduler (`squeue -i`) and job accounting (`sacct`); no GPU command is ever run
+on the login node, which is used only for submission and status.  A deterministic seed is the
+first torch call, the forward-compat `NVIDIA_DISABLE_REQUIRE=1` is exported by default, and
+the candidate is mounted as the only container path with `--container-no-mount-home` so a
+host `~/.local` cannot shadow container packages.
+
+Provenance is recorded as `slurm-batch / <gpu> xN`, so batch numbers never compare against
+local or overlap-mode measurements.  Each run leaves its bundle (script, `*.log`, the result
+JSON) under the scratch root, inspectable with plain `cat`; clean it up explicitly, never
+from inside the job.  See `kbench/slurm_batch.py`.
