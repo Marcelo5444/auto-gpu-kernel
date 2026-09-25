@@ -3,7 +3,7 @@
 # The agent (kopt loop) thinks and edits on the driving machine; the GPU work runs in an
 # sbatch job whose batch step enters a pyxis container on a compute node.  The framework
 # checkout never reaches the cluster -- only the generated harness and the candidate
-# (code-under-test) tree are shipped, into a fresh bundle under the scratch root each run.
+# (code-under-test) tree are shipped, into a fresh per-run bundle under bundle_root.
 #
 #   kopt init-task configs/adasplash_get_output_h100_slurm.toml work/adagpu_h100
 #   # hold a node, or submit per iteration (batch mode allocates on its own):
